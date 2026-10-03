@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -56,6 +56,15 @@ pub enum RuntimeSetting {
     },
 }
 
+/// What the Wine prefix must provide before a Linux launch through Wine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WineRequirement {
+    /// A plain Windows program: an initialized prefix is enough.
+    Prefix,
+    /// A .NET program (RetroBat, EmulatorLauncher): Wine Mono is required.
+    PrefixWithMono,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchPlan {
     pub program: OsString,
@@ -67,9 +76,73 @@ pub struct LaunchPlan {
     /// Directories the backend is configured to use, created before launch.
     pub generated_directories: Vec<PathBuf>,
     pub settings: Vec<RuntimeSetting>,
+    /// The Wine prefix this launch runs in, and what it needs from it.
+    pub wine: Option<(PathBuf, WineRequirement)>,
     /// Backend diagnostic log written by this launch, when the backend
     /// accepts an explicit log destination. It is replaced on every launch.
     pub log_file: Option<PathBuf>,
+    /// Where RetroBat's EmulatorLauncher explains a launch it refused.
+    pub refusal: Option<LauncherRefusal>,
+}
+
+/// EmulatorLauncher does not signal a refused launch (a missing emulator,
+/// BIOS, or driver) through its exit status: it exits normally and leaves
+/// the reason in `%TEMP%\emulationstation.tmp\launch_error.log` for
+/// EmulationStation to show. RetroPort reads the same file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LauncherRefusal {
+    temp: RefusalTemp,
+    /// EmulatorLauncher's own running log.
+    pub log: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RefusalTemp {
+    /// The Windows user's %TEMP%.
+    Directory(PathBuf),
+    /// %TEMP% of whichever user owns this Wine prefix.
+    WinePrefix(PathBuf),
+}
+
+impl LauncherRefusal {
+    fn files(&self) -> Vec<PathBuf> {
+        let report = Path::new("emulationstation.tmp").join("launch_error.log");
+        match &self.temp {
+            RefusalTemp::Directory(temp) => vec![temp.join(report)],
+            RefusalTemp::WinePrefix(prefix) => fs::read_dir(prefix.join("drive_c").join("users"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|user| user.path().join("AppData/Local/Temp").join(&report))
+                .collect(),
+        }
+    }
+
+    /// Forgets reasons left by earlier launches.
+    pub fn clear(&self) {
+        for file in self.files() {
+            let _ = fs::remove_file(file);
+        }
+    }
+
+    /// The reason EmulatorLauncher gave, if it refused this launch.
+    pub fn reason(&self) -> Option<String> {
+        self.files().iter().find_map(|file| {
+            let bytes = fs::read(file).ok()?;
+            let text = match bytes.as_slice() {
+                [0xff, 0xfe, rest @ ..] => String::from_utf16_lossy(
+                    &rest
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .collect::<Vec<_>>(),
+                ),
+                [0xef, 0xbb, 0xbf, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+                bytes => String::from_utf8_lossy(bytes).into_owned(),
+            };
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -86,6 +159,18 @@ pub enum LaunchError {
     UnquotablePath(PathBuf),
     #[error("Wine cannot address a non-Unicode game path: {0}")]
     NonUnicodeWinePath(PathBuf),
+    #[error(
+        "Wine is not installed or not on PATH; install 64-bit Wine to play this system on Linux"
+    )]
+    WineMissing,
+    #[error("Wine could not prepare its prefix at {prefix}: {message}")]
+    WinePrefix { prefix: PathBuf, message: String },
+    #[error(
+        "this system starts through RetroBat's .NET launcher, which needs Wine Mono. \
+         Install your distribution's wine-mono package (or run `WINEPREFIX=\"{0}\" wineboot -u` \
+         and accept Wine's Mono installer), then press PLAY again"
+    )]
+    WineMonoMissing(PathBuf),
     #[error("failed to start the backend: {0}")]
     Io(#[from] io::Error),
 }
@@ -100,7 +185,9 @@ impl LaunchPlan {
             generated_files: Vec::new(),
             generated_directories: Vec::new(),
             settings: Vec::new(),
+            wine: None,
             log_file: None,
+            refusal: None,
         }
     }
 
@@ -114,11 +201,13 @@ impl LaunchPlan {
         linux_data_dir: Option<&Path>,
         program: &Path,
         current_dir: impl Into<PathBuf>,
+        requirement: WineRequirement,
     ) -> Result<Self, LaunchError> {
         let prefix = wine_prefix(linux_data_dir)?;
         let mut plan = Self::new("wine", current_dir).arg(program);
         plan.env
-            .insert("WINEPREFIX".to_owned(), prefix.into_os_string());
+            .insert("WINEPREFIX".to_owned(), prefix.clone().into_os_string());
+        plan.wine = Some((prefix, requirement));
         Ok(plan)
     }
 
@@ -136,6 +225,7 @@ impl LaunchPlan {
                 linux_data_dir,
                 &layout.retrobat_executable(),
                 layout.retrobat_root(),
+                WineRequirement::PrefixWithMono,
             ),
             HostPlatform::Unsupported => Err(LaunchError::Unsupported),
         }
@@ -199,6 +289,7 @@ impl LaunchPlan {
                 linux_data_dir,
                 rom,
                 rom.parent().unwrap_or_else(|| Path::new(".")),
+                WineRequirement::Prefix,
             );
         }
         if host == HostPlatform::Linux
@@ -216,8 +307,20 @@ impl LaunchPlan {
         };
         let mut plan = match host {
             HostPlatform::Windows => Self::new(launcher, layout.emulationstation_root()),
-            _ => Self::under_wine(linux_data_dir, &launcher, layout.emulationstation_root())?,
+            _ => Self::under_wine(
+                linux_data_dir,
+                &launcher,
+                layout.emulationstation_root(),
+                WineRequirement::PrefixWithMono,
+            )?,
         };
+        plan.refusal = Some(LauncherRefusal {
+            temp: match &plan.wine {
+                Some((prefix, _)) => RefusalTemp::WinePrefix(prefix.clone()),
+                None => RefusalTemp::Directory(std::env::temp_dir()),
+            },
+            log: layout.emulationstation_root().join("emulatorLauncher.log"),
+        });
         plan = plan.arg("-system").arg(system);
         if let Some(backend) = backend {
             plan = plan.arg("-emulator").arg(&backend.emulator);
@@ -330,9 +433,12 @@ impl LaunchPlan {
 
         let mut plan = match host {
             HostPlatform::Windows => Self::new(retroarch, layout.retroarch_root()),
-            HostPlatform::Linux => {
-                Self::under_wine(linux_data_dir, &retroarch, layout.retroarch_root())?
-            }
+            HostPlatform::Linux => Self::under_wine(
+                linux_data_dir,
+                &retroarch,
+                layout.retroarch_root(),
+                WineRequirement::Prefix,
+            )?,
             HostPlatform::Unsupported => return Err(LaunchError::Unsupported),
         };
         plan = plan
@@ -403,13 +509,14 @@ impl LaunchPlan {
                 vec!["--installfw".into(), firmware.into()],
                 "rpcs3",
             )),
-            HostPlatform::Linux => {
-                Ok(
-                    Self::under_wine(linux_data_dir, &rpcs3, layout.emulator_root("rpcs3"))?
-                        .arg("--installfw")
-                        .arg(wine_path(firmware)?),
-                )
-            }
+            HostPlatform::Linux => Ok(Self::under_wine(
+                linux_data_dir,
+                &rpcs3,
+                layout.emulator_root("rpcs3"),
+                WineRequirement::Prefix,
+            )?
+            .arg("--installfw")
+            .arg(wine_path(firmware)?)),
             HostPlatform::Unsupported => Err(LaunchError::Unsupported),
         }
     }
@@ -427,8 +534,11 @@ impl LaunchPlan {
         )
     }
 
-    pub fn spawn(&self) -> Result<Child, LaunchError> {
-        self.prepare_runtime()?;
+    /// Prepares everything the backend needs and starts it in its own
+    /// process group. Preparing a new Wine prefix can take a minute, so call
+    /// this from a worker thread; `progress` receives user-facing phases.
+    pub fn spawn(&self, progress: &dyn Fn(&str)) -> Result<Child, LaunchError> {
+        self.prepare_runtime(progress)?;
 
         let mut command = Command::new(&self.program);
         command.args(&self.args).current_dir(&self.current_dir);
@@ -440,10 +550,8 @@ impl LaunchPlan {
         Ok(command.spawn()?)
     }
 
-    fn prepare_runtime(&self) -> Result<(), LaunchError> {
-        if let Some(prefix) = self.env.get("WINEPREFIX") {
-            fs::create_dir_all(prefix)?;
-        }
+    /// Prepares everything the backend needs.
+    pub fn prepare_runtime(&self, progress: &dyn Fn(&str)) -> Result<(), LaunchError> {
         for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] {
             if let Some(directory) = self.env.get(key) {
                 fs::create_dir_all(directory)?;
@@ -472,6 +580,9 @@ impl LaunchPlan {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
+        }
+        if let Some((prefix, requirement)) = &self.wine {
+            prepare_wine_prefix(prefix, *requirement, progress)?;
         }
         Ok(())
     }
@@ -601,6 +712,133 @@ fn set_ini_value(contents: &str, section: &str, key: &str, value: &str) -> Strin
     lines.join("\n") + "\n"
 }
 
+/// Creates the prefix on first use and makes sure it can run what the plan
+/// starts, instead of letting a game launch race Wine's own initialisation.
+fn prepare_wine_prefix(
+    prefix: &Path,
+    requirement: WineRequirement,
+    progress: &dyn Fn(&str),
+) -> Result<(), LaunchError> {
+    let wine_failure = |error: io::Error| match error.kind() {
+        io::ErrorKind::NotFound => LaunchError::WineMissing,
+        _ => LaunchError::WinePrefix {
+            prefix: prefix.to_owned(),
+            message: error.to_string(),
+        },
+    };
+    // Wine writes system.reg early, so its presence does not prove that
+    // initialisation finished; an interrupted wineboot leaves a prefix
+    // without 32-bit support. RetroPort marks a prefix only once wineboot
+    // has completed, and repairs any prefix without that mark.
+    let ready = prefix.join(".retroport-prefix-ready");
+    if !ready.is_file() && prefix_looks_complete(prefix) {
+        // A prefix from an earlier RetroPort version that finished setup.
+        fs::write(&ready, b"existing prefix verified\n")?;
+    }
+    if !ready.is_file() {
+        if prefix.exists() {
+            // Interrupted setup. The prefix holds nothing of the user's own
+            // (games, saves and configuration live in the installation), so
+            // it is moved aside, never deleted, and created afresh.
+            let aside = prefix.with_file_name(format!(
+                "wine-prefix.incomplete-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            ));
+            fs::rename(prefix, aside)?;
+        }
+        progress(
+            "Preparing Wine for its first launch; this can take a minute. \
+             If Wine offers to install Mono or Gecko, choose Install.",
+        );
+        fs::create_dir_all(prefix)?;
+        let status = background_command("wineboot")
+            .arg("--init")
+            .env("WINEPREFIX", prefix)
+            .stdin(Stdio::null())
+            .status()
+            .map_err(wine_failure)?;
+        let _ = background_command("wineserver")
+            .arg("--wait")
+            .env("WINEPREFIX", prefix)
+            .status();
+        if !status.success() || !prefix.join("system.reg").is_file() {
+            return Err(LaunchError::WinePrefix {
+                prefix: prefix.to_owned(),
+                message: format!("wineboot exited with {status}"),
+            });
+        }
+        fs::write(&ready, b"wineboot completed\n")?;
+    }
+    if requirement == WineRequirement::PrefixWithMono && !wine_mono_available(prefix) {
+        if let Some(installer) = cached_wine_mono_installer() {
+            progress("Installing Wine Mono for RetroBat's launcher…");
+            let _ = background_command("wine")
+                .args([OsStr::new("msiexec"), OsStr::new("/i")])
+                .arg(&installer)
+                .arg("/qn")
+                .env("WINEPREFIX", prefix)
+                .stdin(Stdio::null())
+                .status()
+                .map_err(wine_failure)?;
+            let _ = background_command("wineserver")
+                .arg("--wait")
+                .env("WINEPREFIX", prefix)
+                .status();
+        }
+        if !wine_mono_available(prefix) {
+            return Err(LaunchError::WineMonoMissing(prefix.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+/// Whether wineboot finished creating this prefix: its registry exists and a
+/// 64-bit prefix has the 32-bit system directory that setup creates last.
+fn prefix_looks_complete(prefix: &Path) -> bool {
+    let windows = prefix.join("drive_c").join("windows");
+    let win64 = fs::read_to_string(prefix.join("system.reg"))
+        .map(|registry| registry.contains("#arch=win64"));
+    match win64 {
+        Ok(true) => {
+            fs::read_dir(windows.join("syswow64")).is_ok_and(|mut entries| entries.next().is_some())
+        }
+        Ok(false) => windows.join("system32").is_dir(),
+        Err(_) => false,
+    }
+}
+
+/// Wine loads Mono from the prefix or from a system-wide installation.
+fn wine_mono_available(prefix: &Path) -> bool {
+    prefix.join("drive_c").join("windows").join("mono").is_dir()
+        || [
+            "/usr/share/wine/mono",
+            "/usr/lib/wine/mono",
+            "/opt/wine/mono",
+        ]
+        .iter()
+        .any(|directory| fs::read_dir(directory).is_ok_and(|mut entries| entries.next().is_some()))
+}
+
+/// Wine's own Mono download is cached here once the user has accepted it.
+fn cached_wine_mono_installer() -> Option<PathBuf> {
+    let cache = dirs::cache_dir()?.join("wine");
+    let mut installers = fs::read_dir(cache)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with("wine-mono-") && name.ends_with(".msi"))
+        })
+        .collect::<Vec<_>>();
+    installers.sort();
+    installers.pop()
+}
+
 /// A helper process that must never open a console window on Windows.
 pub(crate) fn background_command(program: impl AsRef<OsStr>) -> Command {
     #[allow(unused_mut)]
@@ -665,11 +903,79 @@ pub fn process_tree_is_running(process_id: u32) -> bool {
         // receives no pointer arguments.
         (unsafe { libc::kill(-(process_id as i32), 0) } == 0)
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        windows_tree_is_running(process_id)
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
     {
         let _ = process_id;
         false
     }
+}
+
+/// Whether `root` or any process descended from it is still running. A
+/// launcher such as EmulatorLauncher may exit while the emulator it started
+/// runs on, so descendants count; a listed process counts only while
+/// Windows reports it active, since an exited one stays listed while any
+/// handle to it is open.
+#[cfg(target_os = "windows")]
+fn windows_tree_is_running(root: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, STILL_ACTIVE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: a process snapshot takes no pointers; the handle is checked
+    // and closed below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let mut processes = Vec::new();
+    // SAFETY: PROCESSENTRY32W is plain data; dwSize is set as the API
+    // requires before the first call, and the entry outlives every call.
+    unsafe {
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snapshot, &mut entry);
+        while more != 0 {
+            processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
+            more = Process32NextW(snapshot, &mut entry);
+        }
+        CloseHandle(snapshot);
+    }
+    let mut tree = vec![root];
+    let mut index = 0;
+    while index < tree.len() {
+        let parent = tree[index];
+        for &(process, parent_of) in &processes {
+            if parent_of == parent && process != parent && !tree.contains(&process) {
+                tree.push(process);
+            }
+        }
+        index += 1;
+    }
+    tree.into_iter().any(|process| {
+        if !processes.iter().any(|&(listed, _)| listed == process) {
+            return false;
+        }
+        // SAFETY: the handle is checked before use and always closed.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let queried = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            queried != 0 && code == STILL_ACTIVE as u32
+        }
+    })
 }
 
 fn retroarch_config_path(path: &Path) -> String {
@@ -850,7 +1156,7 @@ mod tests {
         let mut child = LaunchPlan::new("sh", "/tmp")
             .arg("-c")
             .arg("sleep 30 & wait")
-            .spawn()
+            .spawn(&|_| {})
             .unwrap();
         let process_id = child.id();
         assert!(process_tree_is_running(process_id));

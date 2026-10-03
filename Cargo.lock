@@ -2452,6 +2452,7 @@ dependencies = [
  "thiserror 2.0.18",
  "unicode-normalization",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

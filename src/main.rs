@@ -18,7 +18,6 @@ use retrobat_portable::browse::{
 };
 use retrobat_portable::browse_install::{BrowseInstaller, supports_direct_download};
 use retrobat_portable::catalog::{Artwork, Catalog, CatalogEntry};
-use retrobat_portable::controller_guard::ControllerMouseGuard;
 use retrobat_portable::controls::{ControlsCatalog, GameControls};
 use retrobat_portable::featured::FeaturedCatalog;
 use retrobat_portable::firmware::{import_firmware, install_official_firmware};
@@ -26,12 +25,13 @@ use retrobat_portable::import::{
     GameImporter, ImportedManifest, imported_manifests, remove_import,
 };
 use retrobat_portable::install::{Installer, ReqwestDownloader, is_installed};
-use retrobat_portable::launch::{LaunchPlan, process_tree_is_running, terminate_process_tree_id};
+use retrobat_portable::launch::LaunchPlan;
 use retrobat_portable::paths::PortableLayout;
 use retrobat_portable::readiness::{
     BackendState, FirmwareFileStatus, FirmwareInstallAction, FirmwareState, ReadinessReport,
     SystemReadiness,
 };
+use retrobat_portable::session::{GameSession, SessionEvent, SessionPhase};
 
 const INPUT_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(7, 9, 13);
 const CONTROL_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(36, 43, 58);
@@ -482,15 +482,6 @@ struct OperationResult {
     message: String,
 }
 
-struct RunningGame {
-    catalog_id: String,
-    title: String,
-    process_id: u32,
-    exit_receiver: Receiver<String>,
-    launched_at: Instant,
-    termination_requested_at: Option<Instant>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GameButtonIntent {
     Play,
@@ -498,18 +489,21 @@ enum GameButtonIntent {
     Disabled,
 }
 
+/// The card button while a game session exists: LOADING for the first
+/// seconds (a second PLAY is impossible), then TERMINATE, which also cancels
+/// a launch still being prepared.
 fn game_button_state(
-    active: Option<(&str, Duration, bool)>,
+    active: Option<(&str, SessionPhase, Duration)>,
     card_id: &str,
 ) -> (String, GameButtonIntent) {
     match active {
-        Some((id, _, true)) if id == card_id => {
+        Some((id, SessionPhase::Terminating, _)) if id == card_id => {
             ("■  TERMINATING…".to_owned(), GameButtonIntent::Disabled)
         }
-        Some((id, elapsed, false)) if id == card_id && elapsed < Duration::from_secs(5) => {
+        Some((id, _, age)) if id == card_id && age < Duration::from_secs(5) => {
             ("⏳  LOADING…".to_owned(), GameButtonIntent::Disabled)
         }
-        Some((id, _, false)) if id == card_id => {
+        Some((id, _, _)) if id == card_id => {
             ("■  TERMINATE".to_owned(), GameButtonIntent::Terminate)
         }
         Some(_) => ("GAME RUNNING".to_owned(), GameButtonIntent::Disabled),
@@ -517,8 +511,10 @@ fn game_button_state(
     }
 }
 
-fn active_game_repaint_delay(elapsed: Duration, terminating: bool) -> Option<Duration> {
-    (elapsed < Duration::from_secs(5) || terminating).then_some(Duration::from_millis(100))
+fn active_game_repaint_delay(age: Duration, phase: SessionPhase) -> Option<Duration> {
+    (age < Duration::from_secs(5)
+        || matches!(phase, SessionPhase::Preparing | SessionPhase::Terminating))
+    .then_some(Duration::from_millis(100))
 }
 
 fn format_import_size(bytes: u64) -> String {
@@ -652,7 +648,7 @@ struct PortableApp {
     status: String,
     operation: Option<Receiver<OperationResult>>,
     operation_notice: Option<OperationResult>,
-    running_game: Option<RunningGame>,
+    running_game: Option<GameSession>,
     artwork_jobs: SyncSender<ArtworkJob>,
     artwork_receiver: Receiver<ArtworkMessage>,
     textures: HashMap<String, egui::TextureHandle>,
@@ -1088,7 +1084,13 @@ impl PortableApp {
                             &layout,
                             &report.destination,
                         )
-                        .and_then(|plan| plan.spawn().map(|_| ()))
+                        .and_then(|plan| plan.spawn(&|_| {}))
+                        .map(|mut child| {
+                            // Reap the installer when the user closes it.
+                            thread::spawn(move || {
+                                let _ = child.wait();
+                            });
+                        })
                         .map_err(|error| error.to_string())?;
                         Ok(format!(
                             "Downloaded and verified {} bytes from {}. RPCS3's firmware installer is open for confirmation.",
@@ -1878,11 +1880,38 @@ impl PortableApp {
 
     fn launch_library(&mut self) {
         let layout = self.layout.clone();
-        self.status =
-            match LaunchPlan::for_current_host(&layout).and_then(|plan| plan.spawn().map(|_| ())) {
-                Ok(()) => "RetroBat launched with the refreshed game library.".to_owned(),
-                Err(error) => format!("Launch failed: {error}"),
-            };
+        match LaunchPlan::for_current_host(&layout) {
+            Ok(plan) => {
+                self.status = "Opening RetroBat's library…".to_owned();
+                // RetroBat is a separate application; its process is reaped
+                // in the background so it never lingers as a zombie.
+                let context = self.context.clone();
+                let (sender, receiver) = mpsc::channel();
+                self.operation = Some(receiver);
+                thread::spawn(move || {
+                    let result = plan.spawn(&|_| {}).map(|mut child| {
+                        thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                    });
+                    let _ = sender.send(match result {
+                        Ok(()) => OperationResult {
+                            success: true,
+                            heading: "RETROBAT LIBRARY OPEN".to_owned(),
+                            message: "RetroBat launched with the refreshed game library."
+                                .to_owned(),
+                        },
+                        Err(error) => OperationResult {
+                            success: false,
+                            heading: "RETROBAT DID NOT START".to_owned(),
+                            message: format!("RetroBat could not be launched: {error}"),
+                        },
+                    });
+                    context.request_repaint();
+                });
+            }
+            Err(error) => self.status = format!("Launch failed: {error}"),
+        }
     }
 
     fn launch_game(&mut self, catalog_id: &str, title: &str, system: &str, rom: &std::path::Path) {
@@ -1898,7 +1927,6 @@ impl PortableApp {
             .and_then(|report| report.select_backend(system, rom))
             .cloned();
         let route_label = backend.as_ref().map(|route| route.label());
-        self.status = format!("Loading {title}…");
         let plan =
             match LaunchPlan::for_current_game_with_backend(&layout, system, rom, backend.as_ref())
             {
@@ -1908,77 +1936,25 @@ impl PortableApp {
                     return;
                 }
             };
-        let controller_guard = match ControllerMouseGuard::acquire_if_available() {
-            Ok(guard) => guard,
-            Err(error) => {
-                self.status = format!(
-                    "Could not suspend the desktop controller-to-mouse mapping; {title} was not launched: {error}"
-                );
-                return;
-            }
-        };
-        match plan.spawn() {
-            Ok(mut child) => {
-                let process_id = child.id();
-                let (exit_sender, exit_receiver) = mpsc::channel();
-                let context = self.context.clone();
-                let game_title = title.to_owned();
-                thread::spawn(move || {
-                    let result = child.wait();
-                    while process_tree_is_running(process_id) {
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    let guard_result = controller_guard
-                        .map(ControllerMouseGuard::release)
-                        .transpose();
-                    let mut message = match result {
-                        Ok(status) => format!("{game_title} closed ({status})."),
-                        Err(error) => format!("Could not monitor {game_title}: {error}"),
-                    };
-                    if let Err(error) = guard_result {
-                        message.push_str(&format!(
-                            " The desktop controller-to-mouse mapping could not be restored: {error}"
-                        ));
-                    }
-                    let _ = exit_sender.send(message);
-                    context.request_repaint();
-                });
-                self.running_game = Some(RunningGame {
-                    catalog_id: catalog_id.to_owned(),
-                    title: title.to_owned(),
-                    process_id,
-                    exit_receiver,
-                    launched_at: Instant::now(),
-                    termination_requested_at: None,
-                });
-                self.status = route_label.map_or_else(
-                    || format!("Loading {title}; its configured backend is starting…"),
-                    |route| format!("Loading {title} through the installed {route} backend…"),
-                );
-            }
-            Err(error) => {
-                drop(controller_guard);
-                self.status = format!("Could not launch {title}: {error}");
-            }
-        }
+        let context = self.context.clone();
+        self.running_game = Some(GameSession::start(plan, catalog_id, title, move || {
+            context.request_repaint()
+        }));
+        self.status = route_label.map_or_else(
+            || format!("Loading {title}; its configured backend is starting…"),
+            |route| format!("Loading {title} through the installed {route} backend…"),
+        );
     }
 
     fn terminate_running_game(&mut self) {
         let Some(game) = &mut self.running_game else {
             return;
         };
-        if game.termination_requested_at.is_some() {
+        if game.phase() == SessionPhase::Terminating {
             return;
         }
-        match terminate_process_tree_id(game.process_id, false) {
-            Ok(()) => {
-                game.termination_requested_at = Some(Instant::now());
-                self.status = format!("Terminating {} and its emulator process tree…", game.title);
-            }
-            Err(error) => {
-                self.status = format!("Could not terminate {}: {error}", game.title);
-            }
-        }
+        game.terminate();
+        self.status = format!("Terminating {} and its emulator process tree…", game.title);
     }
 }
 
@@ -2047,23 +2023,9 @@ impl eframe::App for PortableApp {
                     .root
                     .join(&manifest.launch_relative_path);
                 self.launch_game(&entry.id, &entry.title, &manifest.system, &rom);
-                if self.running_game.is_some() {
-                    let (sender, receiver) = mpsc::channel();
-                    let (duration, repaint) = self
-                        .gameplay_probe
-                        .as_ref()
-                        .map(|probe| (probe.config.duration, self.context.clone()))
-                        .expect("gameplay probe exists");
-                    thread::spawn(move || {
-                        thread::sleep(duration);
-                        let _ = sender.send(());
-                        repaint.request_repaint();
-                    });
-                    if let Some(probe) = &mut self.gameplay_probe {
-                        probe.deadline_receiver = Some(receiver);
-                        let _ = probe.record("game_launched");
-                    }
-                } else if let Some(probe) = &self.gameplay_probe {
+                if self.running_game.is_none()
+                    && let Some(probe) = &self.gameplay_probe
+                {
                     let _ = probe.record("launch_failed");
                     context.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -2103,12 +2065,42 @@ impl eframe::App for PortableApp {
         } else if self.readiness_refresh.is_some() {
             context.request_repaint_after(Duration::from_millis(100));
         }
-        if let Some(game) = &mut self.running_game
-            && game
-                .termination_requested_at
-                .is_some_and(|started| started.elapsed() >= Duration::from_secs(2))
-        {
-            let _ = terminate_process_tree_id(game.process_id, true);
+        let session_events = self
+            .running_game
+            .as_mut()
+            .map(GameSession::poll)
+            .unwrap_or_default();
+        for event in session_events {
+            match event {
+                SessionEvent::Phase(phase) => self.status = phase,
+                SessionEvent::Started { .. } => {
+                    if let Some(probe) = &mut self.gameplay_probe {
+                        // The measured window starts with the backend itself,
+                        // not with first-time preparation such as Wine setup.
+                        let (sender, receiver) = mpsc::channel();
+                        let duration = probe.config.duration;
+                        let repaint = self.context.clone();
+                        thread::spawn(move || {
+                            thread::sleep(duration);
+                            let _ = sender.send(());
+                            repaint.request_repaint();
+                        });
+                        probe.deadline_receiver = Some(receiver);
+                        let _ = probe.record("game_launched");
+                    }
+                }
+                SessionEvent::Exited { message, .. } => {
+                    self.running_game = None;
+                    if let Some(probe) = &mut self.gameplay_probe
+                        && probe.started
+                        && !probe.terminating
+                    {
+                        let _ = probe.record("exited_before_deadline");
+                        probe.terminating = true;
+                    }
+                    self.status = message;
+                }
+            }
         }
         let gameplay_probe_deadline = self
             .gameplay_probe
@@ -2123,24 +2115,14 @@ impl eframe::App for PortableApp {
             }
             self.terminate_running_game();
         }
-        let game_finished = self
-            .running_game
-            .as_ref()
-            .and_then(|game| game.exit_receiver.try_recv().ok());
-        if let Some(status) = game_finished {
-            self.running_game = None;
-            self.status = status;
-        } else if let Some(game) = &self.running_game {
+        if let Some(game) = &self.running_game {
             // Do not continuously render the frontend while a fullscreen game
             // covers it. On native Wayland, presenting an occluded GL surface
             // can wait on compositor/GPU frame availability long enough to
-            // prevent winit from answering xdg_wm_base pings. The process
-            // watcher requests a repaint on exit; only the short loading and
-            // forced-termination transitions need timers here.
-            if let Some(delay) = active_game_repaint_delay(
-                game.launched_at.elapsed(),
-                game.termination_requested_at.is_some(),
-            ) {
+            // prevent winit from answering xdg_wm_base pings. The session
+            // requests a repaint for every event; only the loading,
+            // preparation, and forced-termination transitions need timers.
+            if let Some(delay) = active_game_repaint_delay(game.age(), game.phase()) {
                 context.request_repaint_after(delay);
             }
         }
@@ -2775,18 +2757,7 @@ impl eframe::App for PortableApp {
                                                             .is_some()
                                                         {
                                                             game_button_state(
-                                                                self.running_game.as_ref().map(
-                                                                    |game| {
-                                                                        (
-                                                                            game.catalog_id
-                                                                                .as_str(),
-                                                                            game.launched_at
-                                                                                .elapsed(),
-                                                                            game.termination_requested_at
-                                                                                .is_some(),
-                                                                        )
-                                                                    },
-                                                                ),
+                                                                self.running_game.as_ref().map(|game| (game.catalog_id.as_str(), game.phase(), game.age())),
                                                                 &entry.id,
                                                             )
                                                         } else {
@@ -2887,18 +2858,7 @@ impl eframe::App for PortableApp {
                                                             || imported.is_some();
                                                         let (label, game_intent) = if game_ready {
                                                             game_button_state(
-                                                                self.running_game.as_ref().map(
-                                                                    |game| {
-                                                                        (
-                                                                            game.catalog_id
-                                                                                .as_str(),
-                                                                            game.launched_at
-                                                                                .elapsed(),
-                                                                            game.termination_requested_at
-                                                                                .is_some(),
-                                                                        )
-                                                                    },
-                                                                ),
+                                                                self.running_game.as_ref().map(|game| (game.catalog_id.as_str(), game.phase(), game.age())),
                                                                 &entry.id,
                                                             )
                                                         } else {
@@ -3423,14 +3383,20 @@ mod ui_tests {
     #[test]
     fn play_is_disabled_as_soon_as_a_game_starts_loading() {
         let (label, intent) = game_button_state(
-            Some(("mspacman", Duration::from_millis(10), false)),
+            Some((
+                "mspacman",
+                SessionPhase::Preparing,
+                Duration::from_millis(10),
+            )),
             "mspacman",
         );
         assert_eq!(label, "⏳  LOADING…");
         assert_eq!(intent, GameButtonIntent::Disabled);
 
-        let (other_label, other_intent) =
-            game_button_state(Some(("mspacman", Duration::from_secs(10), false)), "pacman");
+        let (other_label, other_intent) = game_button_state(
+            Some(("mspacman", SessionPhase::Running, Duration::from_secs(10))),
+            "pacman",
+        );
         assert_eq!(other_label, "GAME RUNNING");
         assert_eq!(other_intent, GameButtonIntent::Disabled);
     }
@@ -3438,7 +3404,7 @@ mod ui_tests {
     #[test]
     fn running_game_exposes_terminate_instead_of_a_second_play() {
         let (label, intent) = game_button_state(
-            Some(("mspacman", Duration::from_secs(10), false)),
+            Some(("mspacman", SessionPhase::Running, Duration::from_secs(10))),
             "mspacman",
         );
         assert_eq!(label, "■  TERMINATE");
@@ -3470,15 +3436,15 @@ mod ui_tests {
     #[test]
     fn fullscreen_game_does_not_keep_redrawing_the_covered_frontend() {
         assert_eq!(
-            active_game_repaint_delay(Duration::from_secs(1), false),
+            active_game_repaint_delay(Duration::from_secs(1), SessionPhase::Running),
             Some(Duration::from_millis(100))
         );
         assert_eq!(
-            active_game_repaint_delay(Duration::from_secs(6), false),
+            active_game_repaint_delay(Duration::from_secs(6), SessionPhase::Running),
             None
         );
         assert_eq!(
-            active_game_repaint_delay(Duration::from_secs(6), true),
+            active_game_repaint_delay(Duration::from_secs(6), SessionPhase::Terminating),
             Some(Duration::from_millis(100))
         );
     }

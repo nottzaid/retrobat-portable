@@ -11,6 +11,7 @@ pub mod install;
 pub mod launch;
 pub mod paths;
 pub mod readiness;
+pub mod session;
 pub mod sources;
 
 use serde::Serialize;
