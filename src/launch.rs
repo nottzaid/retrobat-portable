@@ -595,6 +595,22 @@ impl LaunchPlan {
         }
     }
 
+    /// Installs Sony's PS Vita system software or font package into Vita3K.
+    pub fn for_vita3k_firmware_install(
+        layout: &PortableLayout,
+        host: HostPlatform,
+        firmware: &Path,
+    ) -> Result<Self, LaunchError> {
+        vita3k_plan(layout, host, vec!["--firmware".into(), firmware.into()])
+    }
+
+    pub fn for_current_vita3k_firmware_install(
+        layout: &PortableLayout,
+        firmware: &Path,
+    ) -> Result<Self, LaunchError> {
+        Self::for_vita3k_firmware_install(layout, HostPlatform::current(), firmware)
+    }
+
     pub fn for_current_rpcs3_firmware_install(
         layout: &PortableLayout,
         firmware: &Path,

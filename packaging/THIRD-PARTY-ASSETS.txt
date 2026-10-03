@@ -163,6 +163,22 @@ The publisher file and installed dev_flash are private bundle state and are not
 committed to the public source repository. The product's INSTALL FIRMWARE
 action fetches and verifies these exact publisher bytes on the user's machine.
 
+PS Vita system software and font package (private-machine installation)
+-------------------------------------------------------------------------
+Sony support page:
+https://www.playstation.com/en-us/support/hardware/psvita/system-software/
+System software 3.74, as that page links it:
+http://dus01.psv.update.playstation.net/update/psv/image/2022_0209/rel_f2c7b12fe85496ec88a0391b514d6e3b/PSVUPDAT.PUP
+Size: 133834240 bytes
+SHA-256: 6ef6dc8da6db026f28647713e473486d770087a605c52a8d751bfca7478386cf
+Font package, from Sony's PS Vita update server:
+http://dus01.psp2.update.playstation.net/update/psp2/image/2022_0209/sd_59dcf059d3328fb67be7e51f8aa33418/PSP2UPDAT.PUP
+Size: 56778752 bytes
+SHA-256: c3c03fc7363dd573d90e5157629bf11551f434b283cc898d9ffc71dd716b791c
+For both, the MD5 embedded in Sony's URL matched before the size and SHA-256
+were recorded. Like the PS3 file, they are fetched and verified on the user's
+machine by INSTALL FIRMWARE and never committed.
+
 Progetto-SNAPS MAME snapshots
 -----------------------------
 Purpose: locally bundled gameplay imagery for 5,655 MAME catalogue records.

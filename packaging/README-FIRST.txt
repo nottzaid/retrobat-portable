@@ -53,14 +53,19 @@ controller-as-mouse input while an emulator runs and restores it on exit.
 FIRMWARE
 --------
 
-RetroPort uses firmware-free Play! (PS2), YabaSanshiro (Saturn), and
-Cxbx-Reloaded (original Xbox) routes where available.
+RetroPort uses official firmware. Where the maker publishes it (Sony's PS3
+and PS Vita system software), INSTALL FIRMWARE downloads it from the maker,
+verifies it, and installs it into the emulator. Everything else comes from
+your own console: IMPORT FIRMWARE accepts the file for a listed target, or
+recognises every BIOS in a folder you choose by fingerprint and places each
+where its emulators look. RetroPort records each file's hash and never
+rejects an unfamiliar dump. Switch prod.keys are copied into both Eden
+profiles.
 
-INSTALL FIRMWARE retrieves and verifies a declared publisher file before
-opening its emulator installer. IMPORT FIRMWARE accepts any nonempty file you
-select and records its hash without rejecting unfamiliar bytes. Switch
-prod.keys are copied into both Eden profiles. Optional firmware follows the
-same flow; documented built-in fallbacks produce no warning.
+Your BIOS switches PLAY to the reference emulator: PCSX2 for PS2, Beetle PSX
+for PS1, xemu for Xbox, Beetle Saturn for Saturn. Until then PS2 runs on
+Play!, PS1 on PCSX ReARMed, and Xbox on Cxbx-Reloaded, all of which need no
+BIOS. Each card names the file, why it is needed, and where it comes from.
 
 VERIFY OR TROUBLESHOOT
 ----------------------

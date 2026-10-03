@@ -91,6 +91,9 @@ pub struct FirmwareFileStatus {
     pub directory: bool,
     pub optional: bool,
     pub present: bool,
+    /// Other files that satisfy this requirement just as well (another
+    /// region's or model's BIOS); `present` is true when any one is.
+    pub alternatives: Vec<String>,
     pub guidance_url: String,
     pub guidance: String,
     pub download: Option<FirmwareDownload>,
@@ -111,6 +114,8 @@ pub struct FirmwareDownload {
 pub enum FirmwareInstallAction {
     PlaceInBios,
     Rpcs3,
+    /// Vita3K installs Sony's update package into its own system partitions.
+    Vita3k,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -683,6 +688,25 @@ fn summarize_required_firmware(
                 .or_insert_with(|| (file, system.clone(), core.clone()));
         }
     }
+    let mut groups = Vec::new();
+    for system in systems {
+        let Some(core) = backend_routes
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(system))
+            .and_then(|(_, routes)| routes.first())
+            .and_then(|route| route.core.as_deref())
+        else {
+            continue;
+        };
+        for group in required_firmware_groups(system, core) {
+            // Each alternative alone satisfies the group, so none of them is
+            // listed separately as optional.
+            for path in group.paths {
+                discovered.remove(*path);
+            }
+            groups.push((group, system.clone(), core.to_owned()));
+        }
+    }
     for system in systems {
         let selected_emulator = backend_routes
             .iter()
@@ -696,27 +720,54 @@ fn summarize_required_firmware(
         }
     }
     let bios_root = layout.retrobat_root().join("bios");
-    let files = discovered
+    let mut files = groups
         .into_iter()
-        .map(|(path, (file, system, core))| {
-            let (guidance_url, guidance) = firmware_guidance(&system, &core, file.optional);
-            let download = official_firmware_download(&system, &path);
+        .map(|(group, system, core)| {
+            let (guidance_url, guidance) = firmware_guidance(&system, &core, false);
             FirmwareFileStatus {
-                relative_path: path.clone(),
-                description: file.description,
-                directory: file.directory,
-                optional: file.optional,
-                present: if file.directory {
-                    directory_contains_regular_file(&bios_root.join(&path))
-                } else {
-                    bios_root.join(&path).is_file()
-                },
+                relative_path: group.paths[0].to_owned(),
+                description: group.description.to_owned(),
+                directory: false,
+                optional: false,
+                present: group
+                    .paths
+                    .iter()
+                    .any(|path| bios_root.join(path).is_file()),
+                alternatives: group.paths[1..]
+                    .iter()
+                    .map(|path| (*path).to_owned())
+                    .collect(),
                 guidance_url: guidance_url.to_owned(),
                 guidance: guidance.to_owned(),
-                download,
+                download: None,
             }
         })
         .collect::<Vec<_>>();
+    files.extend(discovered.into_iter().map(|(path, (file, system, core))| {
+        let (guidance_url, guidance) = firmware_guidance(&system, &core, file.optional);
+        let download = official_firmware_download(&system, &path);
+        FirmwareFileStatus {
+            relative_path: path.clone(),
+            description: file.description,
+            directory: file.directory,
+            optional: file.optional,
+            alternatives: Vec::new(),
+            present: if file.directory {
+                directory_contains_regular_file(&bios_root.join(&path))
+            } else if system == "ps3" && path == "PS3UPDAT.PUP" {
+                ps3_firmware_installed(layout, &bios_root)
+            } else if system == "psvita" && path == "PSVUPDAT.PUP" {
+                crate::vita::system_software_installed(layout)
+            } else if system == "psvita" && path == "PSP2UPDAT.PUP" {
+                crate::vita::fonts_installed(layout)
+            } else {
+                bios_root.join(&path).is_file()
+            },
+            guidance_url: guidance_url.to_owned(),
+            guidance: guidance.to_owned(),
+            download,
+        }
+    }));
     let required = files
         .iter()
         .filter(|file| !file.optional)
@@ -760,6 +811,21 @@ fn summarize_required_firmware(
     }
 }
 
+/// PS3 games need the firmware installed into RPCS3, not merely downloaded.
+/// On Windows RetroBat installs bios/PS3UPDAT.PUP on the next launch; the
+/// native Linux RPCS3 keeps its own dev_flash, filled by its installer.
+fn ps3_firmware_installed(layout: &PortableLayout, bios_root: &Path) -> bool {
+    let native = layout.linux_runtime_root().join("RPCS3.AppImage");
+    if cfg!(target_os = "linux") && native.is_file() {
+        layout
+            .metadata_root()
+            .join("runtime/linux/rpcs3/config/rpcs3/dev_flash/vsh/module/vsh.self")
+            .is_file()
+    } else {
+        bios_root.join("PS3UPDAT.PUP").is_file()
+    }
+}
+
 fn official_firmware_download(system: &str, path: &str) -> Option<FirmwareDownload> {
     match (system, path) {
         ("ps3", "PS3UPDAT.PUP") => Some(FirmwareDownload {
@@ -775,6 +841,29 @@ fn official_firmware_download(system: &str, path: &str) -> Option<FirmwareDownlo
             sha256: "158471fd834f8ea8036136b6aab43cd86c7ba73d79ca30e0af3c0fe0001cf365"
                 .to_owned(),
             install_action: FirmwareInstallAction::Rpcs3,
+        }),
+        ("psvita", "PSVUPDAT.PUP") => Some(FirmwareDownload {
+            publisher: "Sony Interactive Entertainment".to_owned(),
+            source_url: "https://www.playstation.com/en-us/support/hardware/psvita/system-software/"
+                .to_owned(),
+            // System software 3.74 as Sony's page links it; the MD5 in the
+            // URL matched before this size and SHA-256 were recorded.
+            url: "http://dus01.psv.update.playstation.net/update/psv/image/2022_0209/rel_f2c7b12fe85496ec88a0391b514d6e3b/PSVUPDAT.PUP".to_owned(),
+            size: 133_834_240,
+            sha256: "6ef6dc8da6db026f28647713e473486d770087a605c52a8d751bfca7478386cf"
+                .to_owned(),
+            install_action: FirmwareInstallAction::Vita3k,
+        }),
+        ("psvita", "PSP2UPDAT.PUP") => Some(FirmwareDownload {
+            publisher: "Sony Interactive Entertainment".to_owned(),
+            source_url: "https://vita3k.org/quickstart.html".to_owned(),
+            // Sony's font package from its own Vita update server; the MD5 in
+            // the URL matched before this size and SHA-256 were recorded.
+            url: "http://dus01.psp2.update.playstation.net/update/psp2/image/2022_0209/sd_59dcf059d3328fb67be7e51f8aa33418/PSP2UPDAT.PUP".to_owned(),
+            size: 56_778_752,
+            sha256: "c3c03fc7363dd573d90e5157629bf11551f434b283cc898d9ffc71dd716b791c"
+                .to_owned(),
+            install_action: FirmwareInstallAction::Vita3k,
         }),
         _ => None,
     }
@@ -831,11 +920,112 @@ fn curated_standalone_firmware(
                 optional: true,
             },
         ],
+        // Vita3K needs Sony's system software, and its font package for any
+        // game that draws system text; Sony publishes both.
+        ("psvita", Some("vita3k")) => vec![
+            CoreFirmwareFile {
+                path: "PSVUPDAT.PUP".to_owned(),
+                description: "Official PS Vita system software (3.74)".to_owned(),
+                directory: false,
+                optional: false,
+            },
+            CoreFirmwareFile {
+                path: "PSP2UPDAT.PUP".to_owned(),
+                description: "Official PS Vita font package".to_owned(),
+                directory: false,
+                optional: false,
+            },
+        ],
         ("switch", Some("eden")) => vec![CoreFirmwareFile {
             path: "eden/keys/prod.keys".to_owned(),
             description: "Nintendo Switch prod.keys dumped from the user's console".to_owned(),
             directory: false,
             optional: false,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+/// Firmware a system cannot start without, where the core's metadata marks
+/// each alternative optional because any single one is enough. Confirmed
+/// against each installed core's source or documentation.
+struct FirmwareGroup {
+    /// Accepted files, preferred first, relative to RetroBat/bios.
+    paths: &'static [&'static str],
+    description: &'static str,
+}
+
+fn required_firmware_groups(system: &str, core: &str) -> Vec<FirmwareGroup> {
+    match (system, core.to_ascii_lowercase().as_str()) {
+        // Genesis Plus GX: "Mega CD BIOS are required files"; it loads the
+        // one matching the game's region.
+        ("megacd" | "segacd", "genesis_plus_gx") => vec![FirmwareGroup {
+            paths: &["bios_CD_U.bin", "bios_CD_E.bin", "bios_CD_J.bin"],
+            description: "Sega CD / Mega CD BIOS for the game's region: bios_CD_U.bin (USA), \
+                          bios_CD_E.bin (Europe) or bios_CD_J.bin (Japan)",
+        }],
+        // Beetle PCE stops with "Firmware not found" for CD games; its
+        // default System Card setting is syscard3.pce.
+        ("pcenginecd", "mednafen_pce" | "mednafen_pce_fast") => vec![FirmwareGroup {
+            paths: &["syscard3.pce"],
+            description: "PC Engine Super CD-ROM² System Card 3.0 (syscard3.pce)",
+        }],
+        // The installed 2019 NeoCD reports "No BIOS detected!" and also needs
+        // the Y-Zoom ROM; it identifies files by content, not name.
+        ("neogeocd", "neocd") => vec![
+            FirmwareGroup {
+                paths: &[
+                    "neocd/neocd_f.rom",
+                    "neocd/neocd_sf.rom",
+                    "neocd/front-sp1.bin",
+                    "neocd/neocd_t.rom",
+                    "neocd/neocd_st.rom",
+                    "neocd/top-sp1.bin",
+                    "neocd/neocd_z.rom",
+                    "neocd/neocd_sz.rom",
+                    "neocd/neocd.bin",
+                    "neocd/uni-bioscd.rom",
+                ],
+                description: "Neo Geo CD BIOS from a front-loading, top-loading or CDZ console",
+            },
+            FirmwareGroup {
+                paths: &["neocd/000-lo.lo", "neocd/ng-lo.rom"],
+                description: "Neo Geo Y-Zoom ROM (000-lo.lo or ng-lo.rom)",
+            },
+        ],
+        // Opera: "One of the following system BIOSes is required".
+        ("3do", "opera") => vec![FirmwareGroup {
+            paths: &[
+                "panafz10.bin",
+                "panafz1.bin",
+                "panafz10-norsa.bin",
+                "panafz10e-anvil.bin",
+                "panafz10e-anvil-norsa.bin",
+                "panafz1j.bin",
+                "panafz1j-norsa.bin",
+                "goldstar.bin",
+                "sanyotry.bin",
+            ],
+            description: "3DO system BIOS (Panasonic FZ-1/FZ-10, Goldstar or Sanyo)",
+        }],
+        ("fds", "fceumm" | "nestopia" | "mesen") => vec![FirmwareGroup {
+            paths: &["disksys.rom"],
+            description: "Famicom Disk System BIOS (disksys.rom)",
+        }],
+        ("n64dd", "mupen64plus_next") => vec![FirmwareGroup {
+            paths: &["Mupen64plus/IPL.n64"],
+            description: "Nintendo 64DD IPL ROM (IPL.n64)",
+        }],
+        // Beetle Saturn loads the BIOS for the game's region.
+        ("saturn", "mednafen_saturn") => vec![FirmwareGroup {
+            paths: &["mpr-17933.bin", "sega_101.bin"],
+            description: "Saturn BIOS for the game's region: mpr-17933.bin (USA/Europe) or \
+                          sega_101.bin (Japan)",
+        }],
+        // FinalBurn Neo: the neogeo BIOS set is required for Neo Geo games.
+        ("neogeo", "fbneo") => vec![FirmwareGroup {
+            paths: &["fbneo/neogeo.zip"],
+            description: "Neo Geo BIOS set (neogeo.zip)",
         }],
         _ => Vec::new(),
     }
@@ -954,9 +1144,53 @@ fn firmware_guidance(system: &str, core: &str, optional: bool) -> (&'static str,
             "https://xemu.app/docs/required-files/",
             "Cxbx-Reloaded runs Xbox games without a BIOS. Add your console's MCPX boot ROM and flash BIOS and PLAY switches to xemu, the reference Xbox emulator; xemu's guide shows how to dump both.",
         ),
+        "psvita" => (
+            "https://www.playstation.com/en-us/support/hardware/psvita/system-software/",
+            "Sony publishes the PS Vita system software and font package. INSTALL FIRMWARE downloads each from Sony, verifies it, and installs it into Vita3K.",
+        ),
         "switch" => (
             "https://git.eden-emu.dev/eden-emu/eden",
             "Eden requires prod.keys to decrypt retail Switch game copies. Select the prod.keys dumped from your own console; RetroPort places it into both Windows and Linux portable Eden data stores.",
+        ),
+        "megacd" | "segacd" => (
+            "https://docs.libretro.com/library/genesis_plus_gx/#bios",
+            "Sega CD games start only with the BIOS of a console you own, matching the game's region. Dump it from your console, or point RetroPort at your BIOS folder: it recognises each file by fingerprint.",
+        ),
+        "pcenginecd" => (
+            "https://docs.libretro.com/library/beetle_pce/#bios",
+            "PC Engine CD games start only with the System Card 3.0 image from a card you own. Dump it, or point RetroPort at your BIOS folder: it recognises the file by fingerprint.",
+        ),
+        "neogeocd" => (
+            "https://github.com/libretro/neocd_libretro#bios-files",
+            "Neo Geo CD games need a BIOS and the Y-Zoom ROM from a console you own. NeoCD identifies them by content, so any of the listed files works.",
+        ),
+        "3do" => (
+            "https://docs.libretro.com/library/opera/#bios",
+            "3DO games start only with the system BIOS of a console you own. Any one of the listed BIOS files is enough.",
+        ),
+        "fds" => (
+            "https://docs.libretro.com/library/fceumm/#bios",
+            "Famicom Disk System games need disksys.rom dumped from your own Disk System RAM adapter.",
+        ),
+        "n64dd" => (
+            "https://docs.libretro.com/library/mupen64plus/",
+            "64DD disks start only with the 64DD IPL ROM from a drive you own.",
+        ),
+        "neogeo" => (
+            "https://docs.libretro.com/library/fbneo/#bios",
+            "Neo Geo games need the neogeo.zip BIOS set from the same MAME/FBNeo romset collection as your games.",
+        ),
+        "lynx" => (
+            "https://docs.libretro.com/library/beetle_lynx/#bios",
+            "Every installed Lynx core needs lynxboot.img dumped from a console you own.",
+        ),
+        "colecovision" => (
+            "https://docs.libretro.com/library/gearcoleco/#bios",
+            "ColecoVision games need the console's BIOS (colecovision.rom) dumped from a console you own.",
+        ),
+        "intellivision" => (
+            "https://docs.libretro.com/library/freeintv/#bios",
+            "Intellivision games need the console's exec.bin and grom.bin dumped from a console you own.",
         ),
         "gb" | "gbc" | "gba" if optional => (
             "https://docs.libretro.com/guides/bios/",

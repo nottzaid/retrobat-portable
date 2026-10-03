@@ -19,7 +19,10 @@ use retrobat_portable::catalog::{Artwork, Catalog, CatalogEntry};
 use retrobat_portable::controls::{ControlsCatalog, GameControls};
 use retrobat_portable::downloads::PinnedDownload;
 use retrobat_portable::featured::FeaturedCatalog;
-use retrobat_portable::firmware::{import_firmware, install_official_firmware};
+use retrobat_portable::firmware::{
+    FirmwareFolderReport, FirmwareRecord, Recognition, firmware_record, import_firmware,
+    import_firmware_folder, install_official_firmware,
+};
 use retrobat_portable::import::{
     GameImporter, ImportedManifest, imported_manifests, remove_import,
 };
@@ -62,6 +65,10 @@ Actions:
   --download ID           Download a card's game from its pinned source, verify it, and install it
   --import ID --file PATH Import your own game file, archive, or folder onto a card
   --remove ID             Remove what DOWNLOAD or IMPORT placed for a card, keeping modified files
+  --import-firmware PATH  Recognise every BIOS/firmware file in PATH (a file or a folder, searched
+                          recursively) by fingerprint and place each where its emulators look
+  --install-firmware SYS  Download a system's firmware from its maker, verify it, and install it
+                          (ps3, psvita: Sony's official system software)
   --self-check            Validate the installation and print the report as JSON
                           (--self-check-output FILE also writes it to FILE)
   --gameplay-probe ID     Play an installed card through PLAY, hold it, terminate it, and record
@@ -78,6 +85,143 @@ Options:
 
 A card's ID appears when you hover over its title, for example homebrew-hub/dango-dash.
 ";
+
+fn describe_firmware_folder(report: &FirmwareFolderReport) -> String {
+    let mut text = String::new();
+    for (source, target, recognition) in &report.placed {
+        let how = match recognition {
+            Recognition::Fingerprint => "fingerprint",
+            Recognition::Structure => "file structure",
+            Recognition::Name => "file name",
+        };
+        text.push_str(&format!(
+            "Placed bios/{target} from {} (recognised by {how}).\n",
+            source.display()
+        ));
+    }
+    for target in &report.kept_existing {
+        text.push_str(&format!(
+            "Kept your existing bios/{target}; a different file matched it.\n"
+        ));
+    }
+    if report
+        .placed
+        .iter()
+        .any(|(_, target, _)| target == "PS3UPDAT.PUP")
+    {
+        text.push_str(
+            "The PS3 system software is in place; INSTALL FIRMWARE on a PS3 card (or \
+             --install-firmware ps3) installs it into RPCS3.\n",
+        );
+    }
+    text.push_str(&format!(
+        "Examined {} file(s): placed {}, already present {}, unrecognised {}.\n",
+        report.examined,
+        report.placed.len(),
+        report.already_present,
+        report.unrecognised
+    ));
+    text
+}
+
+/// Installs a system's firmware from its maker's own download.
+fn install_firmware_cli(layout: &PortableLayout, system: &str) -> i32 {
+    let browse = match BrowseCatalog::built_in() {
+        Ok(browse) => browse,
+        Err(error) => {
+            eprintln!("Browse catalog rejected: {error}");
+            return 1;
+        }
+    };
+    let report = match ReadinessReport::audit(layout, &browse.entries) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("Readiness audit failed: {error}");
+            return 1;
+        }
+    };
+    let downloadable = report
+        .for_catalog_system(system)
+        .map(|readiness| {
+            readiness
+                .firmware_files
+                .iter()
+                .filter(|file| file.download.is_some())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if downloadable.is_empty() {
+        eprintln!(
+            "{system} has no firmware its maker publishes for download; its card names the file \
+             and how to obtain it, and --import-firmware places it."
+        );
+        return 2;
+    }
+    for firmware in downloadable {
+        if firmware.present {
+            println!("bios/{} is already installed.", firmware.relative_path);
+            continue;
+        }
+        let status = install_one_firmware(layout, &firmware);
+        if status != 0 {
+            return status;
+        }
+    }
+    0
+}
+
+fn install_one_firmware(layout: &PortableLayout, firmware: &FirmwareFileStatus) -> i32 {
+    let download = firmware.download.clone().unwrap();
+    let installed = ReqwestDownloader::new()
+        .map_err(|error| error.to_string())
+        .and_then(|downloader| {
+            install_official_firmware(layout, firmware, &downloader)
+                .map_err(|error| error.to_string())
+        });
+    let report = match installed {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("Firmware installation failed safely: {error}");
+            return 1;
+        }
+    };
+    println!(
+        "Verified {} bytes from {} at {}.",
+        report.bytes,
+        download.publisher,
+        report.destination.display()
+    );
+    let (emulator, plan) = match download.install_action {
+        FirmwareInstallAction::PlaceInBios => return 0,
+        FirmwareInstallAction::Rpcs3 => (
+            "RPCS3",
+            LaunchPlan::for_current_rpcs3_firmware_install(layout, &report.destination),
+        ),
+        FirmwareInstallAction::Vita3k => (
+            "Vita3K",
+            LaunchPlan::for_current_vita3k_firmware_install(layout, &report.destination),
+        ),
+    };
+    println!("Installing it into {emulator}…");
+    let status = plan
+        .and_then(|plan| plan.spawn(&|phase| println!("{phase}")))
+        .and_then(|mut child| child.wait().map_err(Into::into));
+    match status {
+        Ok(status) if status.success() => {
+            println!("{emulator} installed bios/{}.", firmware.relative_path);
+            0
+        }
+        Ok(status) => {
+            eprintln!("{emulator}'s firmware installer exited with {status}.");
+            1
+        }
+        Err(error) => {
+            eprintln!("Could not run {emulator}'s firmware installer: {error}");
+            1
+        }
+    }
+}
 
 fn usage_error(message: &str) -> ! {
     eprintln!("{message}\nRun RetroPort --help for usage.");
@@ -121,6 +265,8 @@ fn main() -> eframe::Result {
     let mut gameplay_probe_id = None;
     let mut gameplay_probe_output = None;
     let mut gameplay_probe_seconds = 20u64;
+    let mut firmware_source: Option<PathBuf> = None;
+    let mut firmware_system: Option<String> = None;
     // Paths are taken as the OS gives them, so a name that is not valid
     // UTF-8 still reaches the filesystem intact.
     let mut args = std::env::args_os().skip(1);
@@ -140,6 +286,10 @@ fn main() -> eframe::Result {
             "--download" => download_id = Some(flag_id(&mut args, flag)),
             "--import" => import_id = Some(flag_id(&mut args, flag)),
             "--remove" => remove_id = Some(flag_id(&mut args, flag)),
+            "--import-firmware" => {
+                firmware_source = Some(flag_path(&mut args, flag, "a BIOS file or folder"));
+            }
+            "--install-firmware" => firmware_system = Some(flag_id(&mut args, flag)),
             "--file" => import_file = Some(flag_path(&mut args, flag, "a local game path")),
             "--self-check-output" => {
                 self_check_output = Some(flag_path(&mut args, flag, "a path"));
@@ -171,11 +321,13 @@ fn main() -> eframe::Result {
         import_id.is_some(),
         remove_id.is_some(),
         gameplay_probe_id.is_some(),
+        firmware_source.is_some(),
+        firmware_system.is_some(),
     ];
     if actions.into_iter().filter(|chosen| *chosen).count() > 1 {
         usage_error(
             "Choose one action: --self-check, --download, --import, --remove, \
-             --gameplay-probe, --install, or --uninstall.",
+             --import-firmware, --install-firmware, --gameplay-probe, --install, or --uninstall.",
         );
     }
 
@@ -290,6 +442,21 @@ fn main() -> eframe::Result {
             }
         }
         return Ok(());
+    }
+    if let Some(source) = firmware_source {
+        match import_firmware_folder(&layout, &source) {
+            Ok(report) => {
+                print!("{}", describe_firmware_folder(&report));
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("Firmware import failed safely: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(system) = firmware_system {
+        std::process::exit(install_firmware_cli(&layout, &system));
     }
     if let Some(requested_id) = remove_id {
         match remove_import(&layout, &requested_id) {
@@ -523,6 +690,7 @@ struct ImportDialog {
 struct FirmwareDialog {
     system: String,
     files: Vec<FirmwareFileStatus>,
+    records: Vec<Option<FirmwareRecord>>,
     selected_firmware: usize,
     browser: FileBrowser,
     message: String,
@@ -697,15 +865,20 @@ struct BrowseViewKey {
 }
 
 impl FirmwareDialog {
-    fn new(readiness: &SystemReadiness) -> Self {
+    fn new(readiness: &SystemReadiness, layout: &PortableLayout) -> Self {
         let files = readiness.firmware_files.clone();
         let selected_firmware = files.iter().position(|file| !file.present).unwrap_or(0);
+        let records = files
+            .iter()
+            .map(|file| firmware_record(layout, &file.relative_path))
+            .collect();
         Self {
             system: readiness.catalog_system.clone(),
             files,
+            records,
             selected_firmware,
             browser: FileBrowser::new(),
-            message: "Choose the firmware target, then select the file you obtained. Known hashes are informational, not a gate.".to_owned(),
+            message: "Select the file for a target below, or open the folder holding your BIOS files and let RetroPort recognise every one by fingerprint (dropping a folder here does the same). RetroPort records each file's SHA-256; an unfamiliar dump is never rejected.".to_owned(),
         }
     }
 }
@@ -1354,7 +1527,7 @@ impl PortableApp {
             CardAction::Import(entry) => self.import_dialog = Some(ImportDialog::new(entry)),
             CardAction::Download(entry) => self.start_browse_download(entry),
             CardAction::Firmware(readiness) => {
-                self.firmware_dialog = Some(FirmwareDialog::new(&readiness));
+                self.firmware_dialog = Some(FirmwareDialog::new(&readiness, &self.layout));
             }
             CardAction::Controls(entry) => {
                 if let Some(controls) = &self.controls {
@@ -1499,6 +1672,32 @@ impl PortableApp {
         });
     }
 
+    fn start_firmware_folder_import(&mut self, folder: PathBuf) {
+        let layout = self.layout.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.operation = Some(receiver);
+        self.status = format!("Recognising BIOS files in {}…", folder.display());
+        thread::spawn(move || {
+            let result = match import_firmware_folder(&layout, &folder) {
+                Ok(report) => OperationResult {
+                    success: true,
+                    heading: if report.placed.is_empty() {
+                        "NO NEW FIRMWARE FOUND".to_owned()
+                    } else {
+                        "FIRMWARE READY".to_owned()
+                    },
+                    message: describe_firmware_folder(&report),
+                },
+                Err(error) => OperationResult {
+                    success: false,
+                    heading: "FIRMWARE IMPORT FAILED".to_owned(),
+                    message: format!("Firmware import failed safely: {error}"),
+                },
+            };
+            let _ = sender.send(result);
+        });
+    }
+
     fn start_firmware_download(&mut self, firmware: FirmwareFileStatus) {
         let layout = self.layout.clone();
         let Some(download) = firmware.download.clone() else {
@@ -1522,6 +1721,22 @@ impl PortableApp {
                         report.bytes,
                         report.destination.display()
                     )),
+                    FirmwareInstallAction::Vita3k => {
+                        let status = LaunchPlan::for_current_vita3k_firmware_install(
+                            &layout,
+                            &report.destination,
+                        )
+                        .and_then(|plan| plan.spawn(&|_| {}))
+                        .and_then(|mut child| child.wait().map_err(Into::into))
+                        .map_err(|error| error.to_string())?;
+                        if !status.success() {
+                            return Err(format!("Vita3K's firmware installer exited with {status}"));
+                        }
+                        Ok(format!(
+                            "Downloaded and verified {} bytes from {}, and Vita3K installed it.",
+                            report.bytes, download.publisher
+                        ))
+                    }
                     FirmwareInstallAction::Rpcs3 => {
                         LaunchPlan::for_current_rpcs3_firmware_install(
                             &layout,
@@ -1701,16 +1916,19 @@ impl PortableApp {
         });
         let mut import = None;
         let mut direct_download = None;
+        let mut folder_import = None;
         let mut close = false;
         let Some(dialog) = &mut self.firmware_dialog else {
             return;
         };
-        if let Some(path) = dropped
-            && path.is_file()
-        {
-            dialog.browser.path_text = path.display().to_string();
-            dialog.browser.selected = Some(path);
-            dialog.message = "Dropped file selected. Confirm the destination below.".to_owned();
+        if let Some(path) = dropped {
+            if path.is_file() {
+                dialog.browser.path_text = path.display().to_string();
+                dialog.browser.selected = Some(path);
+                dialog.message = "Dropped file selected. Confirm the destination below.".to_owned();
+            } else if path.is_dir() {
+                folder_import = Some(path);
+            }
         }
         let directory_entries = dialog.browser.entries();
 
@@ -1734,11 +1952,16 @@ impl PortableApp {
                 "REQUIRED"
             };
             let state = if firmware.present { "READY" } else { "MISSING" };
+            let alternatives = if firmware.alternatives.is_empty() {
+                String::new()
+            } else {
+                format!(" (or {})", firmware.alternatives.join(", "))
+            };
             if root
                 .selectable_label(
                     dialog.selected_firmware == index,
                     format!(
-                        "{kind} · bios/{}{} · {state}",
+                        "{kind} · bios/{}{}{alternatives} · {state}",
                         firmware.relative_path,
                         if firmware.directory { "/" } else { "" }
                     ),
@@ -1785,6 +2008,24 @@ impl PortableApp {
                     .color(egui::Color32::from_gray(130)),
             );
         });
+        if let Some(record) = dialog
+            .records
+            .get(dialog.selected_firmware)
+            .cloned()
+            .flatten()
+        {
+            root.label(
+                egui::RichText::new(format!(
+                    "Recorded: {} · {} · SHA-256 {}",
+                    record.origin,
+                    format_import_size(record.size),
+                    record.sha256
+                ))
+                .small()
+                .monospace()
+                .color(egui::Color32::from_gray(150)),
+            );
+        }
         root.add_space(6.0);
 
         if let Some(download) = &target.download {
@@ -1930,13 +2171,30 @@ impl PortableApp {
                 import = Some((target.clone(), source));
             }
             if ui
+                .add_enabled(
+                    self.operation.is_none(),
+                    egui::Button::new("RECOGNISE EVERY BIOS IN THIS FOLDER").fill(CONTROL_BACKGROUND),
+                )
+                .on_hover_text(
+                    "Searches this folder and its subfolders, identifies each BIOS or firmware file \
+                     by fingerprint for every system, and places it where its emulators look. \
+                     A different file already in place is kept.",
+                )
+                .clicked()
+            {
+                folder_import = Some(dialog.browser.directory.clone());
+            }
+            if ui
                 .add(egui::Button::new("CANCEL").fill(CONTROL_BACKGROUND))
                 .clicked()
             {
                 close = true;
             }
         });
-        if let Some(firmware) = direct_download {
+        if let Some(folder) = folder_import {
+            self.firmware_dialog = None;
+            self.start_firmware_folder_import(folder);
+        } else if let Some(firmware) = direct_download {
             self.firmware_dialog = None;
             self.start_firmware_download(firmware);
         } else if let Some((firmware, source)) = import {
