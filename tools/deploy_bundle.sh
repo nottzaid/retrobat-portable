@@ -50,22 +50,25 @@ assemble_launchers_and_documents "$project"
 "$project/tools/build_bundle_checksums.sh" "$project"
 
 if [[ "$bundle" != "$project" ]]; then
-    mkdir -p "$bundle"
-    for directory in RetroBat Runtime Artwork .retrobat-portable Source; do
+    for directory in RetroBat Runtime Artwork; do
         if [[ ! -d "$project/$directory" ]]; then
             echo "local source bundle is incomplete: missing $project/$directory" >&2
             exit 1
         fi
-        mkdir -p "$bundle/$directory"
-        rsync -rt --delete --modify-window=1 \
-            "$project/$directory/" "$bundle/$directory/"
     done
-    for file in \
-        RetroPort-Linux RetroPort.exe RetroPort-Linux.desktop README-FIRST.txt \
-        THIRD-PARTY-ASSETS.txt VERIFY-LINUX.sh VERIFY-WINDOWS.cmd \
-        VERIFY-WINDOWS.ps1 LICENSE-RETROPORT.txt
-    do
-        cp -f "$project/$file" "$bundle/$file"
+    mkdir -p "$bundle/.retrobat-portable"
+    # 1. Static files: exactly those in the integrity manifest. They are
+    #    pinned and verified, so the destination's copy is replaced.
+    static_list=$(mktemp)
+    trap 'rm -f "$static_list"' EXIT
+    cut -c67- "$project/SHA256SUMS" > "$static_list"
+    rsync -t --files-from="$static_list" "$project/" "$bundle/"
+    # 2. Everything else in the runtime trees is added only where the
+    #    destination lacks it. Games, saves, BIOS files, emulator state and
+    #    .retrobat-portable at the destination are never deleted or
+    #    overwritten.
+    for directory in RetroBat Runtime Artwork; do
+        rsync -rt --ignore-existing "$project/$directory/" "$bundle/$directory/"
     done
     chmod +x "$bundle/RetroPort-Linux" "$bundle/VERIFY-LINUX.sh"
     "$project/tools/build_bundle_checksums.sh" "$bundle"

@@ -25,6 +25,9 @@ runtime_files=(
     RetroBat/emulators/retroarch/cores/jaxe_libretro.dll \
     RetroBat/emulators/xenia-canary/xenia_canary.exe \
     RetroBat/emulators/xenia-canary/LICENSE-XENIA.txt \
+    RetroBat/RetroBat.exe \
+    RetroBat/emulationstation/emulationstation.exe \
+    RetroBat/emulationstation/emulatorLauncher.exe \
     RetroBat/emulators/play/Play.exe
 )
 for required in "${runtime_files[@]}"
@@ -71,6 +74,7 @@ do
             ! -name 'settings.ini' \
             ! -name 'RPCS3.buf' \
             ! -name 'portable.txt' \
+            ! -name '*.installer-bak*' \
             -print0 >> "$static_list"
     fi
 done
