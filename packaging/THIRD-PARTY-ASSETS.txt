@@ -31,13 +31,13 @@ Purpose: CHIP-8, S-CHIP, and XO-CHIP support.
 Project: https://github.com/kurtjd/jaxe
 Documentation: https://docs.libretro.com/library/jaxe/
 License: MIT
-Binary source:
-https://buildbot.libretro.com/nightly/windows/x86_64/latest/jaxe_libretro.dll.zip
-Retrieved: 2026-07-12
-Archive SHA-256:
-1b239ae91d742b615daffbf2d8ab6154d78912261d964918a4b301a18999e9e0
-Extracted jaxe_libretro.dll SHA-256:
-9f284ff90b3f8cbe654224cc7992c2b472ed3797cdfabeccdd2986ae1c4276f0
+Binary source: the immutable RetroArch 1.22.2 stable core bundle (libretro's
+nightly URL is rebuilt in place, so it cannot be pinned):
+https://buildbot.libretro.com/stable/1.22.2/windows/x86_64/RetroArch_cores.7z
+Bundle SHA-256:
+86b871e11b9b4772ac644b40a38f2c8e9449da1f355eae7da08aa061148547b0
+Member RetroArch-Win64/cores/jaxe_libretro.dll SHA-256:
+fa056612cc58f987ae4d9074765e080897b763b52891f19f5f817c8677942b2a
 
 Xenia Canary
 ------------
@@ -100,9 +100,10 @@ SHA-256 a6bcc2bc42a362d10213819948f3152fae7d47f70067f25939b51d3ddcfb0896
 shadPS4 0.16.0 Windows SDL archive:
 https://github.com/shadps4-emu/shadPS4/releases/download/v.0.16.0/shadps4-win64-sdl-0.16.0.zip
 SHA-256 f6cdcca82f239fb69b2f820ad9dec07f2f00b423273851b67a0e24bc783acf46
-shadPS4 QtLauncher v224 Windows archive:
-https://github.com/shadps4-emu/shadps4-qtlauncher/releases/download/v224/shadPS4QtLauncher-win64-qt-v224.zip
-SHA-256 021871249bae6867900f62efd728a6cbdbed9934b69c28488b41d413280e2e1d
+shadPS4 QtLauncher 2026-10-02 (4c4e109) Windows archive (optional settings GUI;
+the project deletes superseded builds, so the bootstrap skips it if absent):
+https://github.com/shadps4-emu/shadps4-qtlauncher/releases/download/shadPS4QtLauncher-2026-10-02-4c4e1090ea53dc1ec956fa9954acbf143d104b2e/shadPS4QtLauncher-win64-qt-2026-10-02-4c4e109.zip
+SHA-256 (published by GitHub) 7aaab50f623dfea987ed11e3fa6374c34f5fce988ab0673e4b0ab7216b7fab9f
 
 Eden 0.2.1 Windows amd64 MSVC archive:
 https://stable.eden-emu.dev/v0.2.1/Eden-Windows-v0.2.1-amd64-msvc-standard.zip
