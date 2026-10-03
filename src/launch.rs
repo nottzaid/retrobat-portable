@@ -83,6 +83,32 @@ pub struct LaunchPlan {
     pub log_file: Option<PathBuf>,
     /// Where RetroBat's EmulatorLauncher explains a launch it refused.
     pub refusal: Option<LauncherRefusal>,
+    /// A disc image unpacked (once) before the emulator starts.
+    pub unpacked_disc: Option<UnpackedDisc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnpackedDisc {
+    pub kind: DiscFormat,
+    pub image: PathBuf,
+    pub destination: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscFormat {
+    /// An original-Xbox XDVDFS image, for Cxbx-Reloaded.
+    Xbox,
+    /// A gzip-compressed PS2 image, for Play!.
+    Gzip,
+}
+
+impl UnpackedDisc {
+    fn launch_file(&self) -> PathBuf {
+        self.destination.join(match self.kind {
+            DiscFormat::Xbox => "default.xbe",
+            DiscFormat::Gzip => "disc.iso",
+        })
+    }
 }
 
 /// EmulatorLauncher does not signal a refused launch (a missing emulator,
@@ -171,6 +197,8 @@ pub enum LaunchError {
          and accept Wine's Mono installer), then press PLAY again"
     )]
     WineMonoMissing(PathBuf),
+    #[error(transparent)]
+    XboxDisc(#[from] crate::xiso::XisoError),
     #[error("failed to start the backend: {0}")]
     Io(#[from] io::Error),
 }
@@ -188,6 +216,7 @@ impl LaunchPlan {
             wine: None,
             log_file: None,
             refusal: None,
+            unpacked_disc: None,
         }
     }
 
@@ -299,10 +328,30 @@ impl LaunchPlan {
             return Ok(plan);
         }
 
+        // RetroBat hands Cxbx-Reloaded a disc image only by mounting it
+        // through the Dokan driver, and Play! reads no gzip images; RetroPort
+        // unpacks those itself.
+        let emulator = backend.map(|route| route.emulator.to_ascii_lowercase());
+        let extension = rom
+            .extension()
+            .map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+        let unpacked_disc = match (emulator.as_deref(), extension.as_deref()) {
+            (Some("cxbx"), Some("iso")) => Some(DiscFormat::Xbox),
+            (Some("play"), Some("gz")) => Some(DiscFormat::Gzip),
+            _ => None,
+        }
+        .map(|kind| UnpackedDisc {
+            kind,
+            image: rom.to_owned(),
+            destination: layout.unpacked_disc(rom),
+        });
+        let launch_file = unpacked_disc
+            .as_ref()
+            .map_or_else(|| rom.to_owned(), UnpackedDisc::launch_file);
         let launcher = layout.emulator_launcher_executable();
         let rom_argument = match host {
-            HostPlatform::Windows => rom.to_owned(),
-            HostPlatform::Linux => wine_path(rom)?,
+            HostPlatform::Windows => launch_file,
+            HostPlatform::Linux => wine_path(&launch_file)?,
             HostPlatform::Unsupported => return Err(LaunchError::Unsupported),
         };
         let mut plan = match host {
@@ -314,6 +363,7 @@ impl LaunchPlan {
                 WineRequirement::PrefixWithMono,
             )?,
         };
+        plan.unpacked_disc = unpacked_disc;
         plan.refusal = Some(LauncherRefusal {
             temp: match &plan.wine {
                 Some((prefix, _)) => RefusalTemp::WinePrefix(prefix.clone()),
@@ -579,6 +629,18 @@ impl LaunchPlan {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
+            }
+        }
+        if let Some(disc) = &self.unpacked_disc {
+            match disc.kind {
+                DiscFormat::Xbox => {
+                    progress("Unpacking the Xbox disc for Cxbx-Reloaded (first PLAY only)…");
+                    crate::xiso::unpack_cached(&disc.image, &disc.destination)?;
+                }
+                DiscFormat::Gzip => {
+                    progress("Decompressing the disc image for Play! (first PLAY only)…");
+                    crate::xiso::gunzip_cached(&disc.image, &disc.destination)?;
+                }
             }
         }
         if let Some((prefix, requirement)) = &self.wine {

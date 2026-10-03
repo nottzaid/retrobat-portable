@@ -30,6 +30,8 @@ pub enum ImportError {
     MissingFilename,
     #[error("cannot read {path}: {source}")]
     Source { path: PathBuf, source: io::Error },
+    #[error("{0} is not an original-Xbox disc image; select the game's ISO (XISO or full dump)")]
+    NotXboxDisc(String),
     #[error("the selected path is not a regular file: {0}")]
     NotAFile(PathBuf),
     #[error("the selected path is not a safe directory: {0}")]
@@ -226,6 +228,12 @@ impl<'a> GameImporter<'a> {
                 system: profile.rom_folder,
                 extension,
             });
+        }
+        if profile.rom_folder == "xbox"
+            && extension == ".iso"
+            && crate::xiso::game_partition(source)?.is_none()
+        {
+            return Err(ImportError::NotXboxDisc(file_name_text(source)));
         }
 
         let source_root = source
@@ -818,6 +826,17 @@ pub fn remove_import(
     fs::remove_file(record_path)?;
     for parent in parents.into_iter().rev() {
         prune_empty_import_directories(&parent, &system_root)?;
+    }
+    {
+        // A disc's unpacked copy is RetroPort's own derived data.
+        let launch = layout.root.join(&manifest.launch_relative_path);
+        let unpacked = layout.unpacked_disc(&launch);
+        for directory in [unpacked.with_extension("unpacking"), unpacked] {
+            match fs::remove_dir_all(&directory) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+                _ => {}
+            }
+        }
     }
     Ok(report)
 }
