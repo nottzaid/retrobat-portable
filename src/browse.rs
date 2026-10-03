@@ -106,12 +106,23 @@ pub enum BrowseError {
 
 impl BrowseCatalog {
     pub fn built_in() -> Result<Self, BrowseError> {
-        let mut catalog: Self = serde_json::from_str(LIBRARY)?;
-        let mut decoder = GzDecoder::new(CLASSICS_LIBRARY);
-        let mut decoded = String::new();
-        decoder.read_to_string(&mut decoded)?;
-        let classics: Self = serde_json::from_str(&decoded)?;
-        let iconic: Self = serde_json::from_str(ICONIC_LIBRARY)?;
+        // The classics snapshot is most of the work; decode it while the
+        // smaller snapshots parse.
+        let (classics, catalog, iconic) = std::thread::scope(|scope| {
+            let classics = scope.spawn(|| -> Result<Self, BrowseError> {
+                let mut decoded = Vec::with_capacity(64 << 20);
+                GzDecoder::new(CLASSICS_LIBRARY).read_to_end(&mut decoded)?;
+                Ok(serde_json::from_slice(&decoded)?)
+            });
+            let catalog = serde_json::from_str::<Self>(LIBRARY);
+            let iconic = serde_json::from_str::<Self>(ICONIC_LIBRARY);
+            (
+                classics.join().expect("classics decoder thread"),
+                catalog,
+                iconic,
+            )
+        });
+        let (mut catalog, classics, iconic) = (catalog?, classics?, iconic?);
         catalog.sources.extend(classics.sources);
         catalog.entries.extend(classics.entries);
         catalog.sources.extend(iconic.sources);
@@ -138,7 +149,7 @@ impl BrowseCatalog {
             }
         }
 
-        let mut ids = HashSet::new();
+        let mut ids = HashSet::with_capacity(self.entries.len());
         for entry in &self.entries {
             if entry.id.is_empty() || !ids.insert(entry.id.as_str()) {
                 return Err(BrowseError::Id(entry.id.clone()));
@@ -149,51 +160,22 @@ impl BrowseCatalog {
                     source_id: entry.source_id.clone(),
                 });
             }
-            if let Some(url) = &entry.artwork_url {
-                validate_https_url(url).map_err(|()| BrowseError::ArtworkUrl {
-                    id: entry.id.clone(),
-                    url: url.clone(),
-                })?;
-            }
-            if let Some(asset) = &entry.artwork_asset {
-                let path = Path::new(&asset.path);
-                let safe_path = !path.as_os_str().is_empty()
-                    && !path.is_absolute()
-                    && path
-                        .components()
-                        .all(|component| matches!(component, Component::Normal(_)))
-                    && path.starts_with("Artwork");
-                let valid_hash = asset.sha256.len() == 64
-                    && asset
-                        .sha256
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-                if !safe_path || asset.size == 0 || !valid_hash {
-                    return Err(BrowseError::ArtworkAsset {
-                        id: entry.id.clone(),
-                        path: asset.path.clone(),
-                    });
-                }
-            }
-            if let Some(url) = &entry.detail_url {
-                validate_https_url(url).map_err(|()| BrowseError::DetailUrl {
-                    id: entry.id.clone(),
-                    url: url.clone(),
-                })?;
-            }
-            for sha1 in &entry.known_sha1 {
-                if sha1.len() != 40
-                    || !sha1
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                {
-                    return Err(BrowseError::Sha1 {
-                        id: entry.id.clone(),
-                        sha1: sha1.clone(),
-                    });
-                }
-            }
         }
+        // URL parsing dominates validation; entries are independent.
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |count| count.get())
+            .clamp(1, 8);
+        let chunk = self.entries.len().div_ceil(workers).max(1);
+        std::thread::scope(|scope| {
+            let checks = self
+                .entries
+                .chunks(chunk)
+                .map(|entries| scope.spawn(move || entries.iter().try_for_each(validate_entry)))
+                .collect::<Vec<_>>();
+            checks
+                .into_iter()
+                .try_for_each(|check| check.join().expect("validation thread"))
+        })?;
         for source in &self.sources {
             let actual = self
                 .entries
@@ -210,6 +192,54 @@ impl BrowseCatalog {
         }
         Ok(())
     }
+}
+
+fn validate_entry(entry: &BrowseEntry) -> Result<(), BrowseError> {
+    if let Some(url) = &entry.artwork_url {
+        validate_https_url(url).map_err(|()| BrowseError::ArtworkUrl {
+            id: entry.id.clone(),
+            url: url.clone(),
+        })?;
+    }
+    if let Some(asset) = &entry.artwork_asset {
+        let path = Path::new(&asset.path);
+        let safe_path = !path.as_os_str().is_empty()
+            && !path.is_absolute()
+            && path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+            && path.starts_with("Artwork");
+        let valid_hash = asset.sha256.len() == 64
+            && asset
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !safe_path || asset.size == 0 || !valid_hash {
+            return Err(BrowseError::ArtworkAsset {
+                id: entry.id.clone(),
+                path: asset.path.clone(),
+            });
+        }
+    }
+    if let Some(url) = &entry.detail_url {
+        validate_https_url(url).map_err(|()| BrowseError::DetailUrl {
+            id: entry.id.clone(),
+            url: url.clone(),
+        })?;
+    }
+    for sha1 in &entry.known_sha1 {
+        if sha1.len() != 40
+            || !sha1
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(BrowseError::Sha1 {
+                id: entry.id.clone(),
+                sha1: sha1.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_https_url(value: &str) -> Result<(), ()> {

@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,6 +35,11 @@ use retrobat_portable::readiness::{
     SystemReadiness,
 };
 use retrobat_portable::session::{GameSession, SessionEvent, SessionPhase};
+
+// The catalogues are tens of thousands of small strings; mimalloc parses
+// them noticeably faster than the system allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const INPUT_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(7, 9, 13);
 const CONTROL_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(36, 43, 58);
@@ -573,7 +578,14 @@ fn backend_log_evidence(path: &std::path::Path) -> BackendLogEvidence {
 
 struct ArtworkMessage {
     entry_id: String,
-    result: Result<DecodedArtwork, String>,
+    result: ArtworkResult,
+}
+
+enum ArtworkResult {
+    Decoded(DecodedArtwork),
+    Failed(String),
+    /// The page that asked for it is no longer shown.
+    Skipped,
 }
 
 struct DecodedArtwork {
@@ -591,24 +603,72 @@ enum ArtworkSource {
 struct ArtworkJob {
     entry_id: String,
     source: ArtworkSource,
+    generation: u64,
 }
 
-// Two readers bound storage and image-decoding pressure. Four simultaneous
-// reads were enough to starve the desktop event loop on slower storage and
-// trigger the compositor's "Application Not Responding" watchdog.
-const ARTWORK_WORKERS: usize = 2;
+// Network fetches mostly wait, so four workers keep remote covers flowing;
+// disk reads and decoding are limited to two at a time because more
+// simultaneous reads starved the desktop event loop on slow storage and
+// tripped the compositor's "Application Not Responding" watchdog.
+const ARTWORK_WORKERS: usize = 4;
+const ARTWORK_LOCAL_PERMITS: usize = 2;
 const ARTWORK_QUEUE_CAPACITY: usize = 64;
+
+/// A counting semaphore for the local read/decode stage.
+struct Permits {
+    available: Mutex<usize>,
+    released: std::sync::Condvar,
+}
+
+impl Permits {
+    fn acquire(&self) -> PermitGuard<'_> {
+        let mut available = self
+            .available
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while *available == 0 {
+            available = self
+                .released
+                .wait(available)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        *available -= 1;
+        PermitGuard(self)
+    }
+}
+
+struct PermitGuard<'a>(&'a Permits);
+
+impl Drop for PermitGuard<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .available
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) += 1;
+        self.0.released.notify_one();
+    }
+}
 
 fn start_artwork_workers(
     layout: PortableLayout,
     completed: mpsc::Sender<ArtworkMessage>,
+    generation: Arc<AtomicU64>,
+    notify: egui::Context,
 ) -> SyncSender<ArtworkJob> {
     let (jobs, receiver) = mpsc::sync_channel::<ArtworkJob>(ARTWORK_QUEUE_CAPACITY);
     let receiver = Arc::new(Mutex::new(receiver));
+    let permits = Arc::new(Permits {
+        available: Mutex::new(ARTWORK_LOCAL_PERMITS),
+        released: std::sync::Condvar::new(),
+    });
     for worker_index in 0..ARTWORK_WORKERS {
         let receiver = Arc::clone(&receiver);
         let completed = completed.clone();
         let layout = layout.clone();
+        let generation = Arc::clone(&generation);
+        let permits = Arc::clone(&permits);
+        let notify = notify.clone();
         thread::Builder::new()
             .name(format!("artwork-{worker_index}"))
             .spawn(move || {
@@ -623,23 +683,34 @@ fn start_artwork_workers(
                     let Ok(job) = job else {
                         return;
                     };
-                    let bytes = match job.source {
-                        ArtworkSource::Snapshot(url) => match &downloader {
-                            Ok(downloader) => load_snapshot_artwork(&layout, &url, downloader)
-                                .map_err(|error| error.to_string()),
-                            Err(error) => Err(error.clone()),
-                        },
-                        ArtworkSource::Verified(artwork) => match &downloader {
-                            Ok(downloader) => load_or_fetch(&layout, &artwork, downloader)
-                                .map_err(|error| error.to_string()),
-                            Err(error) => Err(error.clone()),
-                        },
-                        ArtworkSource::Bundled(artwork) => load_bundled_artwork(&layout, &artwork)
-                            .map_err(|error| error.to_string()),
+                    let result = if job.generation != generation.load(Ordering::SeqCst) {
+                        ArtworkResult::Skipped
+                    } else {
+                        let bytes = match job.source {
+                            ArtworkSource::Snapshot(url) => match &downloader {
+                                Ok(downloader) => load_snapshot_artwork(&layout, &url, downloader)
+                                    .map_err(|error| error.to_string()),
+                                Err(error) => Err(error.clone()),
+                            },
+                            ArtworkSource::Verified(artwork) => match &downloader {
+                                Ok(downloader) => load_or_fetch(&layout, &artwork, downloader)
+                                    .map_err(|error| error.to_string()),
+                                Err(error) => Err(error.clone()),
+                            },
+                            ArtworkSource::Bundled(artwork) => {
+                                let _permit = permits.acquire();
+                                load_bundled_artwork(&layout, &artwork)
+                                    .map_err(|error| error.to_string())
+                            }
+                        };
+                        match bytes.and_then(|bytes| {
+                            let _permit = permits.acquire();
+                            decode_artwork_for_texture(&bytes).map_err(|error| error.to_string())
+                        }) {
+                            Ok(decoded) => ArtworkResult::Decoded(decoded),
+                            Err(error) => ArtworkResult::Failed(error),
+                        }
                     };
-                    let result = bytes.and_then(|bytes| {
-                        decode_artwork_for_texture(&bytes).map_err(|error| error.to_string())
-                    });
                     if completed
                         .send(ArtworkMessage {
                             entry_id: job.entry_id,
@@ -649,6 +720,7 @@ fn start_artwork_workers(
                     {
                         return;
                     }
+                    notify.request_repaint();
                 }
             })
             .expect("artwork worker thread must start");
@@ -733,7 +805,7 @@ struct FirmwareDialog {
 
 struct LoadedLibrary {
     catalog: Catalog,
-    browse: BrowseCatalog,
+    browse: Arc<BrowseCatalog>,
     readiness: Option<ReadinessReport>,
     featured_ids: HashSet<String>,
     search_documents: Vec<String>,
@@ -1049,11 +1121,14 @@ struct PortableApp {
     running_game: Option<GameSession>,
     artwork_jobs: SyncSender<ArtworkJob>,
     artwork_receiver: Receiver<ArtworkMessage>,
-    textures: HashMap<String, egui::TextureHandle>,
+    /// Uploaded covers with the frame that last showed them.
+    textures: HashMap<String, (egui::TextureHandle, u64)>,
+    frame_number: u64,
+    artwork_generation: Arc<AtomicU64>,
     artwork_errors: HashMap<String, String>,
     artwork_pending: usize,
     artwork_inflight: HashSet<String>,
-    browse: BrowseCatalog,
+    browse: Arc<BrowseCatalog>,
     readiness: Option<ReadinessReport>,
     readiness_refresh: Option<Receiver<Result<ReadinessReport, String>>>,
     featured_ids: HashSet<String>,
@@ -1064,6 +1139,7 @@ struct PortableApp {
     retrobat_present: bool,
     controls: Option<ControlsCatalog>,
     browse_view_key: Option<BrowseViewKey>,
+    browse_page_key: Option<(Option<BrowseViewKey>, usize)>,
     browse_systems: Vec<String>,
     browse_matches: Vec<usize>,
     browse_page: usize,
@@ -1105,7 +1181,45 @@ fn load_library(layout: &PortableLayout) -> LoadedLibrary {
             entries: Vec::new(),
         }
     });
-    let readiness = match ReadinessReport::audit(layout, &browse.entries) {
+    // Everything below depends only on the parsed catalogue; run it
+    // side by side so the library is ready as soon as the slowest part is.
+    let (readiness, search_documents, featured_ids, imported, controls) =
+        std::thread::scope(|scope| {
+            let readiness = scope.spawn(|| ReadinessReport::audit(layout, &browse.entries));
+            let featured = scope.spawn(|| FeaturedCatalog::built_in(&browse));
+            let imported = scope.spawn(|| imported_manifests(layout));
+            let controls = scope.spawn(ControlsCatalog::built_in);
+            let search_documents = browse
+                .entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{} {} {} {} {} {} {} {} {}",
+                        entry.title,
+                        entry.developer,
+                        entry.system,
+                        entry.source_id,
+                        entry.description,
+                        entry.license.as_deref().unwrap_or_default(),
+                        entry
+                            .release_year
+                            .map(|year| year.to_string())
+                            .unwrap_or_default(),
+                        entry.tags.join(" "),
+                        entry.kind,
+                    )
+                    .to_lowercase()
+                })
+                .collect::<Vec<_>>();
+            (
+                readiness.join().expect("readiness audit thread"),
+                search_documents,
+                featured.join().expect("featured thread"),
+                imported.join().expect("import record thread"),
+                controls.join().expect("controls thread"),
+            )
+        });
+    let readiness = match readiness {
         Ok(report) => {
             status = format!(
                 "{status} Backend audit: {} title(s) ready now, {} without an installed emulator, {} unresolved.",
@@ -1120,45 +1234,22 @@ fn load_library(layout: &PortableLayout) -> LoadedLibrary {
             None
         }
     };
-    let search_documents = browse
-        .entries
-        .iter()
-        .map(|entry| {
-            format!(
-                "{} {} {} {} {} {} {} {} {}",
-                entry.title,
-                entry.developer,
-                entry.system,
-                entry.source_id,
-                entry.description,
-                entry.license.as_deref().unwrap_or_default(),
-                entry
-                    .release_year
-                    .map(|year| year.to_string())
-                    .unwrap_or_default(),
-                entry.tags.join(" "),
-                entry.kind,
-            )
-            .to_lowercase()
-        })
-        .collect();
-    let featured_ids = FeaturedCatalog::built_in(&browse)
+    let featured_ids = featured_ids
         .map(|featured| featured.entry_ids)
         .unwrap_or_else(|error| {
             eprintln!("Featured snapshot rejected: {error}");
             HashSet::new()
         });
-    let imported_manifests = imported_manifests(layout);
     let installed_ids = installed_trusted_ids(layout, &catalog);
     LoadedLibrary {
         catalog,
-        browse,
+        browse: Arc::new(browse),
         readiness,
         featured_ids,
         search_documents,
-        imported_manifests,
+        imported_manifests: imported,
         installed_ids,
-        controls: ControlsCatalog::built_in().expect("built-in controls snapshot must validate"),
+        controls: controls.expect("built-in controls snapshot must validate"),
         status,
     }
 }
@@ -1204,7 +1295,13 @@ impl PortableApp {
         context.set_visuals(visuals);
 
         let (artwork_sender, artwork_receiver) = mpsc::channel();
-        let artwork_jobs = start_artwork_workers(layout.clone(), artwork_sender.clone());
+        let artwork_generation = Arc::new(AtomicU64::new(0));
+        let artwork_jobs = start_artwork_workers(
+            layout.clone(),
+            artwork_sender,
+            Arc::clone(&artwork_generation),
+            context.clone(),
+        );
         let (loading_sender, loading_receiver) = mpsc::channel();
         let loading_layout = layout.clone();
         thread::spawn(move || {
@@ -1225,15 +1322,17 @@ impl PortableApp {
             artwork_jobs,
             artwork_receiver,
             textures: HashMap::new(),
+            frame_number: 0,
+            artwork_generation,
             artwork_errors: HashMap::new(),
             artwork_pending: 0,
             artwork_inflight: HashSet::new(),
-            browse: BrowseCatalog {
+            browse: Arc::new(BrowseCatalog {
                 schema_version: 2,
                 generated_at: String::new(),
                 sources: Vec::new(),
                 entries: Vec::new(),
-            },
+            }),
             readiness: None,
             readiness_refresh: None,
             featured_ids: HashSet::new(),
@@ -1243,6 +1342,7 @@ impl PortableApp {
             retrobat_present: layout.retrobat_executable().is_file(),
             controls: None,
             browse_view_key: None,
+            browse_page_key: None,
             browse_systems: Vec::new(),
             browse_matches: Vec::new(),
             browse_page: 0,
@@ -1266,6 +1366,7 @@ impl PortableApp {
             match self.artwork_jobs.try_send(ArtworkJob {
                 entry_id: entry_id.clone(),
                 source,
+                generation: self.artwork_generation.load(Ordering::SeqCst),
             }) {
                 Ok(()) => self.artwork_pending += 1,
                 Err(TrySendError::Full(_)) => {
@@ -1377,7 +1478,7 @@ impl PortableApp {
                     ui.set_min_width(card_width);
                     ui.set_max_width(card_width);
                     let size = egui::vec2(card_width, artwork_height);
-                    if let Some(texture) = self.textures.get(&entry.id) {
+                    if let Some((texture, _)) = self.textures.get(&entry.id) {
                         ui.add(
                             egui::Image::new((texture.id(), size))
                                 .fit_to_exact_size(size)
@@ -1693,6 +1794,25 @@ impl PortableApp {
         }
     }
 
+    fn evict_textures(&mut self) {
+        // Keep the current page and recent ones; a cover is at most 1 MiB of
+        // GPU memory, so 150 bounds the cache near 150 MiB however far the
+        // user browses.
+        const KEEP: usize = 150;
+        if self.textures.len() <= KEEP {
+            return;
+        }
+        let mut by_age = self
+            .textures
+            .iter()
+            .map(|(id, (_, frame))| (*frame, id.clone()))
+            .collect::<Vec<_>>();
+        by_age.sort_unstable();
+        for (_, id) in by_age.into_iter().take(self.textures.len() - KEEP) {
+            self.textures.remove(&id);
+        }
+    }
+
     /// Removes a game an earlier RetroPort version installed through the
     /// trusted catalogue (its record lives in .retrobat-portable/installed).
     fn start_uninstall(&mut self, entry: CatalogEntry) {
@@ -1918,13 +2038,15 @@ impl PortableApp {
             return;
         }
         let layout = self.layout.clone();
-        let entries = self.browse.entries.clone();
+        let browse = Arc::clone(&self.browse);
+        let context = self.context.clone();
         let (sender, receiver) = mpsc::channel();
         self.readiness_refresh = Some(receiver);
         thread::spawn(move || {
             let result =
-                ReadinessReport::audit(&layout, &entries).map_err(|error| error.to_string());
+                ReadinessReport::audit(&layout, &browse.entries).map_err(|error| error.to_string());
             let _ = sender.send(result);
+            context.request_repaint();
         });
     }
 
@@ -2566,9 +2688,7 @@ impl PortableApp {
         root.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    supports_folder
-                        && dialog.browser.directory.is_dir()
-                        && self.operation.is_none(),
+                    supports_folder && dialog.browser.directory.is_dir() && self.operation.is_none(),
                     egui::Button::new("IMPORT THIS FOLDER").fill(CONTROL_BACKGROUND),
                 )
                 .on_hover_text(
@@ -3095,7 +3215,7 @@ impl eframe::App for PortableApp {
             self.artwork_pending = self.artwork_pending.saturating_sub(1);
             self.artwork_inflight.remove(&message.entry_id);
             match message.result {
-                Ok(decoded) => {
+                ArtworkResult::Decoded(decoded) => {
                     let color_image =
                         egui::ColorImage::from_rgba_unmultiplied(decoded.size, &decoded.rgba);
                     let texture = context.load_texture(
@@ -3103,11 +3223,13 @@ impl eframe::App for PortableApp {
                         color_image,
                         egui::TextureOptions::LINEAR,
                     );
-                    self.textures.insert(message.entry_id, texture);
+                    self.textures
+                        .insert(message.entry_id, (texture, self.frame_number));
                 }
-                Err(error) => {
+                ArtworkResult::Failed(error) => {
                     self.artwork_errors.insert(message.entry_id, error);
                 }
+                ArtworkResult::Skipped => {}
             }
             context.request_repaint();
         }
@@ -3358,11 +3480,17 @@ impl eframe::App for PortableApp {
                         .skip(page_start)
                         .take(BROWSE_PAGE_SIZE)
                         .collect();
+                    if self.browse_page_key != Some((self.browse_view_key.clone(), self.browse_page)) {
+                        // A new page makes queued artwork for the old one stale.
+                        self.browse_page_key = Some((self.browse_view_key.clone(), self.browse_page));
+                        self.artwork_generation.fetch_add(1, Ordering::SeqCst);
+                    }
                     let (grid_columns, card_width, grid_spacing) =
                         browse_grid_geometry(library_viewport_width);
                     let artwork_height = (card_width * 2.0 / 3.0).round();
                     let mut actions = Vec::new();
                     let mut artwork_requests = Vec::new();
+                    self.frame_number += 1;
                     egui::Grid::new("browse-card-grid")
                         .num_columns(grid_columns)
                         .spacing([grid_spacing, grid_spacing])
@@ -3377,6 +3505,12 @@ impl eframe::App for PortableApp {
                                 }
                             }
                         });
+                    for &entry_index in &page {
+                        if let Some(texture) = self.textures.get_mut(&self.browse.entries[entry_index].id) {
+                            texture.1 = self.frame_number;
+                        }
+                    }
+                    self.evict_textures();
                     for action in actions {
                         self.perform(action);
                     }
@@ -3556,8 +3690,10 @@ fn decode_artwork_for_texture(bytes: &[u8]) -> image::ImageResult<DecodedArtwork
     limits.max_alloc = Some(64 * 1024 * 1024);
     reader.limits(limits);
     let decoded = reader.decode()?;
-    let decoded = if decoded.width() > 768 || decoded.height() > 768 {
-        decoded.resize(768, 768, image::imageops::FilterType::Triangle)
+    // Cards are at most a few hundred points wide; 512 px stays sharp at 2x
+    // while keeping each texture under 1 MiB.
+    let decoded = if decoded.width() > 512 || decoded.height() > 512 {
+        decoded.resize(512, 512, image::imageops::FilterType::Triangle)
     } else {
         decoded
     };
@@ -3841,8 +3977,8 @@ mod ui_tests {
             .unwrap();
 
         let decoded = decode_artwork_for_texture(encoded.get_ref()).unwrap();
-        assert!(decoded.size[0] <= 768);
-        assert!(decoded.size[1] <= 768);
+        assert!(decoded.size[0] <= 512);
+        assert!(decoded.size[1] <= 512);
         assert_eq!(decoded.rgba.len(), decoded.size[0] * decoded.size[1] * 4);
     }
 }

@@ -17,6 +17,9 @@ pub mod sources;
 pub mod vita;
 pub mod xiso;
 
+use std::collections::BTreeMap;
+use std::time::Instant;
+
 use serde::Serialize;
 use thiserror::Error;
 
@@ -55,6 +58,8 @@ pub struct SelfCheck {
     pub featured_readiness: Option<FeaturedReadinessAudit>,
     pub controls_coverage: ControlsCoverage,
     pub target_platform: &'static str,
+    /// How long each audit phase took, for diagnosing slow storage.
+    pub timings_ms: BTreeMap<&'static str, u64>,
 }
 
 #[derive(Debug, Error)]
@@ -76,11 +81,19 @@ pub enum SelfCheckError {
 }
 
 pub fn self_check(layout: &PortableLayout) -> Result<SelfCheck, SelfCheckError> {
+    let mut timings_ms = BTreeMap::new();
+    let mut clock = Instant::now();
+    let mut lap = |phase: &'static str| {
+        timings_ms.insert(phase, clock.elapsed().as_millis() as u64);
+        clock = Instant::now();
+    };
     let catalog = Catalog::built_in()?;
     let browse = BrowseCatalog::built_in()?;
     let host = HostPlatform::current();
+    lap("catalogues");
     let ledger = downloads::DownloadLedger::built_in()?;
     let download_coverage = audit_download_coverage(&browse.entries);
+    lap("download_ledger");
     let unplayable_downloads = if layout.systems_config().is_file() {
         GameImporter::new(layout).audit_download_formats(&browse.entries, &ledger)?
     } else {
@@ -91,14 +104,18 @@ pub fn self_check(layout: &PortableLayout) -> Result<SelfCheck, SelfCheckError> 
     } else {
         None
     };
+    lap("import_coverage");
     let readiness = if layout.systems_config().is_file() {
         Some(ReadinessReport::audit(layout, &browse.entries)?)
     } else {
         None
     };
+    lap("readiness");
     let bundled_artwork = audit_bundled_artwork(layout, &browse.entries);
+    lap("bundled_artwork");
     let featured = FeaturedCatalog::built_in(&browse)?;
     let controls_coverage = ControlsCatalog::built_in()?.audit_coverage(&browse);
+    lap("featured_and_controls");
     let featured_readiness = readiness
         .as_ref()
         .map(|report| featured.audit_readiness(&browse, report));
@@ -129,5 +146,6 @@ pub fn self_check(layout: &PortableLayout) -> Result<SelfCheck, SelfCheckError> 
         featured_readiness,
         controls_coverage,
         target_platform: host.as_str(),
+        timings_ms,
     })
 }

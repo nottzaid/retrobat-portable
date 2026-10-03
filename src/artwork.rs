@@ -30,14 +30,21 @@ pub enum ArtworkError {
     TooLarge(usize),
     #[error("bundled artwork is not a regular file: {0}")]
     NotAFile(PathBuf),
+    #[error("artwork source did not return an image: {0}")]
+    NotAnImage(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BundledArtworkAudit {
     pub declared_assets: usize,
+    /// Present as a regular file of the recorded size.
     pub verified_assets: usize,
     pub failed_assets: usize,
     pub failure_examples: Vec<String>,
+    /// What "verified" means here. Content hashes are checked every time a
+    /// cover is displayed and by the VERIFY scripts; re-reading every cover
+    /// here would cost tens of seconds on a cold hard disk.
+    pub method: &'static str,
 }
 
 impl BundledArtworkAudit {
@@ -50,30 +57,41 @@ pub fn audit_bundled_artwork(
     layout: &PortableLayout,
     entries: &[BrowseEntry],
 ) -> BundledArtworkAudit {
-    let mut report = BundledArtworkAudit {
-        declared_assets: 0,
-        verified_assets: 0,
-        failed_assets: 0,
-        failure_examples: Vec::new(),
-    };
-    for entry in entries {
-        let Some(asset) = &entry.artwork_asset else {
-            continue;
-        };
-        report.declared_assets += 1;
-        match load_bundled_artwork(layout, asset) {
-            Ok(_) => report.verified_assets += 1,
-            Err(error) => {
-                report.failed_assets += 1;
-                if report.failure_examples.len() < 20 {
-                    report
-                        .failure_examples
-                        .push(format!("{}: {error}", entry.id));
-                }
-            }
-        }
+    let mut assets = entries
+        .iter()
+        .filter_map(|entry| entry.artwork_asset.as_ref().map(|asset| (entry, asset)))
+        .collect::<Vec<_>>();
+    // Path order follows directory order, which keeps metadata reads local.
+    assets.sort_by(|(_, left), (_, right)| left.path.cmp(&right.path));
+    let failures = assets
+        .iter()
+        .filter_map(|(entry, asset)| {
+            let relative = PathBuf::from(&asset.path);
+            let problem = match ensure_safe_parent(&layout.root, &relative) {
+                Err(error) => Some(error.to_string()),
+                Ok(()) => match fs::symlink_metadata(layout.root.join(&relative)) {
+                    Err(error) => Some(error.to_string()),
+                    Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                        Some("not a regular file".to_owned())
+                    }
+                    Ok(metadata) if metadata.len() != asset.size => Some(format!(
+                        "size {} differs from the recorded {}",
+                        metadata.len(),
+                        asset.size
+                    )),
+                    Ok(_) => None,
+                },
+            };
+            problem.map(|problem| format!("{}: {problem}", entry.id))
+        })
+        .collect::<Vec<_>>();
+    BundledArtworkAudit {
+        declared_assets: assets.len(),
+        verified_assets: assets.len() - failures.len(),
+        failed_assets: failures.len(),
+        failure_examples: failures.into_iter().take(20).collect(),
+        method: "present with the recorded size; SHA-256 is checked on display and by VERIFY-*",
     }
-    report
 }
 
 pub fn load_bundled_artwork(
@@ -91,20 +109,22 @@ pub fn load_bundled_artwork(
     if artwork.size > MAX_BYTES || metadata.len() > MAX_BYTES {
         return Err(ArtworkError::TooLarge(MAX_BYTES as usize));
     }
-    let (size, sha256) = digest_file(&path)?;
-    if size != artwork.size {
+    // Read once; verify the bytes that will be shown.
+    let bytes = fs::read(path)?;
+    if bytes.len() as u64 != artwork.size {
         return Err(ArtworkError::Size {
             expected: artwork.size,
-            actual: size,
+            actual: bytes.len() as u64,
         });
     }
+    let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
     if sha256 != artwork.sha256 {
         return Err(ArtworkError::Hash {
             expected: artwork.sha256.clone(),
             actual: sha256,
         });
     }
-    Ok(fs::read(path)?)
+    Ok(bytes)
 }
 
 pub fn load_snapshot_artwork<D: DownloadClient>(
@@ -131,6 +151,10 @@ pub fn load_snapshot_artwork<D: DownloadClient>(
     let mut bytes = LimitedBytes::new(MAX_BYTES);
     downloader.fetch(url, &mut bytes)?;
     let bytes = bytes.into_inner()?;
+    // A server can answer 200 with an error page; only an image is cached.
+    if image::guess_format(&bytes).is_err() {
+        return Err(ArtworkError::NotAnImage(url.to_owned()));
+    }
     let temporary = cache_path.with_extension(format!("{}.tmp", std::process::id()));
     let result = (|| {
         let mut output = File::create(&temporary)?;
@@ -199,13 +223,13 @@ pub fn load_or_fetch<D: DownloadClient>(
     let cache_path = layout.root.join(&relative);
 
     if cache_path.is_file() {
-        match verify(&cache_path, artwork) {
-            Ok(()) => return Ok(fs::read(cache_path)?),
-            Err(ArtworkError::Size { .. } | ArtworkError::Hash { .. }) => {
-                fs::remove_file(&cache_path)?;
-            }
-            Err(error) => return Err(error),
+        let bytes = fs::read(&cache_path)?;
+        if bytes.len() as u64 == artwork.size
+            && hex::encode(sha2::Sha256::digest(&bytes)) == artwork.sha256
+        {
+            return Ok(bytes);
         }
+        fs::remove_file(&cache_path)?;
     }
 
     let unique = SystemTime::now()
