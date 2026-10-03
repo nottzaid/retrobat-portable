@@ -3,7 +3,7 @@
     windows_subsystem = "windows"
 )]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -22,7 +22,9 @@ use retrobat_portable::controller_guard::ControllerMouseGuard;
 use retrobat_portable::controls::{ControlsCatalog, GameControls};
 use retrobat_portable::featured::FeaturedCatalog;
 use retrobat_portable::firmware::{import_firmware, install_official_firmware};
-use retrobat_portable::import::{GameImporter, ImportedManifest, imported_manifest, remove_import};
+use retrobat_portable::import::{
+    GameImporter, ImportedManifest, imported_manifests, remove_import,
+};
 use retrobat_portable::install::{Installer, ReqwestDownloader, is_installed};
 use retrobat_portable::launch::{LaunchPlan, process_tree_is_running, terminate_process_tree_id};
 use retrobat_portable::paths::PortableLayout;
@@ -236,12 +238,7 @@ fn main() -> eframe::Result {
                 eprintln!("Unknown browse catalog id: {requested_id}");
                 std::process::exit(2);
             });
-        let importer = GameImporter::new(&layout);
-        let result = if source.is_dir() {
-            importer.import_directory(entry, &source)
-        } else {
-            importer.import(entry, &source)
-        };
+        let result = GameImporter::new(&layout).import(entry, &source);
         match result {
             Ok(report) => println!(
                 "Imported {} file(s), {} bytes into {}. Launch file: {}",
@@ -474,8 +471,7 @@ struct LoadedLibrary {
     readiness: Option<ReadinessReport>,
     featured_ids: HashSet<String>,
     search_documents: Vec<String>,
-    imported_ids: HashSet<String>,
-    imported_manifests: HashMap<String, ImportedManifest>,
+    imported_manifests: BTreeMap<String, ImportedManifest>,
     controls: ControlsCatalog,
     status: String,
 }
@@ -668,8 +664,7 @@ struct PortableApp {
     readiness_refresh: Option<Receiver<Result<ReadinessReport, String>>>,
     featured_ids: HashSet<String>,
     search_documents: Vec<String>,
-    imported_ids: HashSet<String>,
-    imported_manifests: HashMap<String, ImportedManifest>,
+    imported_manifests: BTreeMap<String, ImportedManifest>,
     retrobat_present: bool,
     controls: Option<ControlsCatalog>,
     browse_view_key: Option<BrowseViewKey>,
@@ -757,36 +752,17 @@ fn load_library(layout: &PortableLayout) -> LoadedLibrary {
             eprintln!("Featured snapshot rejected: {error}");
             HashSet::new()
         });
-    let imported_manifests = load_imported_manifests(layout);
-    let imported_ids = imported_manifests.keys().cloned().collect();
+    let imported_manifests = imported_manifests(layout);
     LoadedLibrary {
         catalog,
         browse,
         readiness,
         featured_ids,
         search_documents,
-        imported_ids,
         imported_manifests,
         controls: ControlsCatalog::built_in().expect("built-in controls snapshot must validate"),
         status,
     }
-}
-
-fn load_imported_manifests(layout: &PortableLayout) -> HashMap<String, ImportedManifest> {
-    let Ok(entries) = std::fs::read_dir(layout.imported_root()) else {
-        return HashMap::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| std::fs::File::open(entry.path()).ok())
-        .filter_map(|file| serde_json::from_reader::<_, ImportedManifest>(file).ok())
-        .filter_map(|manifest| {
-            imported_manifest(layout, &manifest.catalog_id)
-                .ok()
-                .flatten()
-                .map(|validated| (validated.catalog_id.clone(), validated))
-        })
-        .collect()
 }
 
 impl PortableApp {
@@ -855,8 +831,7 @@ impl PortableApp {
             readiness_refresh: None,
             featured_ids: HashSet::new(),
             search_documents: Vec::new(),
-            imported_ids: HashSet::new(),
-            imported_manifests: HashMap::new(),
+            imported_manifests: BTreeMap::new(),
             retrobat_present: layout.retrobat_executable().is_file(),
             controls: None,
             browse_view_key: None,
@@ -955,7 +930,12 @@ impl PortableApp {
                     } else {
                         3
                     };
-                    (tier, !self.imported_ids.contains(&entry.id), title, index)
+                    (
+                        tier,
+                        !self.imported_manifests.contains_key(&entry.id),
+                        title,
+                        index,
+                    )
                 })
                 .collect::<Vec<_>>();
             ranked.sort_unstable();
@@ -999,12 +979,7 @@ impl PortableApp {
         self.status = format!("Copying and preparing {}…", entry.title);
         thread::spawn(move || {
             let title = entry.title.clone();
-            let importer = GameImporter::new(&layout);
-            let result = if source.is_dir() {
-                importer.import_directory(&entry, &source)
-            } else {
-                importer.import(&entry, &source)
-            };
+            let result = GameImporter::new(&layout).import(&entry, &source);
             let result = match result {
                 Ok(report) => OperationResult {
                     success: true,
@@ -1731,10 +1706,10 @@ impl PortableApp {
         }
         root.add_space(6.0);
 
-        let supports_folder = matches!(
-            dialog.entry.system.to_ascii_lowercase().as_str(),
-            "ps3" | "ps4" | "wiiu" | "windows"
-        );
+        // Any game that is a folder of files (PS3/PS4/Wii U dumps, PC games,
+        // PSP homebrew with its assets) imports as a whole. MAME is the
+        // exception: it plays the intact ROM-set ZIP.
+        let supports_folder = !dialog.entry.system.eq_ignore_ascii_case("mame");
         if dialog.entry.system.eq_ignore_ascii_case("mame") {
             root.label(
                 egui::RichText::new(
@@ -1753,7 +1728,7 @@ impl PortableApp {
                     egui::Button::new("IMPORT THIS FOLDER").fill(CONTROL_BACKGROUND),
                 )
                 .on_hover_text(
-                    "Use for extracted PS3/PS4/Wii U games and PC games with DLLs or data folders.",
+                    "Imports the whole folder shown below: extracted PS3/PS4/Wii U games, PC games with their DLLs and data, homebrew with its assets.",
                 )
                 .clicked()
             {
@@ -2027,7 +2002,6 @@ impl eframe::App for PortableApp {
             self.readiness = loaded.readiness;
             self.featured_ids = loaded.featured_ids;
             self.search_documents = loaded.search_documents;
-            self.imported_ids = loaded.imported_ids;
             self.imported_manifests = loaded.imported_manifests;
             self.controls = Some(loaded.controls);
             self.browse_view_key = None;
@@ -2106,8 +2080,7 @@ impl eframe::App for PortableApp {
             self.status = result.message.clone();
             self.operation_notice = Some(result);
             self.operation = None;
-            self.imported_manifests = load_imported_manifests(&self.layout);
-            self.imported_ids = self.imported_manifests.keys().cloned().collect();
+            self.imported_manifests = imported_manifests(&self.layout);
             self.retrobat_present = self.layout.retrobat_executable().is_file();
             self.browse_view_key = None;
             self.refresh_readiness();
