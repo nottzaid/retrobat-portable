@@ -31,13 +31,13 @@ Purpose: CHIP-8, S-CHIP, and XO-CHIP support.
 Project: https://github.com/kurtjd/jaxe
 Documentation: https://docs.libretro.com/library/jaxe/
 License: MIT
-Binary source:
-https://buildbot.libretro.com/nightly/windows/x86_64/latest/jaxe_libretro.dll.zip
-Retrieved: 2026-07-12
-Archive SHA-256:
-1b239ae91d742b615daffbf2d8ab6154d78912261d964918a4b301a18999e9e0
-Extracted jaxe_libretro.dll SHA-256:
-9f284ff90b3f8cbe654224cc7992c2b472ed3797cdfabeccdd2986ae1c4276f0
+Binary source: the immutable RetroArch 1.22.2 stable core bundle (libretro's
+nightly URL is rebuilt in place, so it cannot be pinned):
+https://buildbot.libretro.com/stable/1.22.2/windows/x86_64/RetroArch_cores.7z
+Bundle SHA-256:
+86b871e11b9b4772ac644b40a38f2c8e9449da1f355eae7da08aa061148547b0
+Member RetroArch-Win64/cores/jaxe_libretro.dll SHA-256:
+fa056612cc58f987ae4d9074765e080897b763b52891f19f5f817c8677942b2a
 
 Xenia Canary
 ------------
@@ -100,9 +100,10 @@ SHA-256 a6bcc2bc42a362d10213819948f3152fae7d47f70067f25939b51d3ddcfb0896
 shadPS4 0.16.0 Windows SDL archive:
 https://github.com/shadps4-emu/shadPS4/releases/download/v.0.16.0/shadps4-win64-sdl-0.16.0.zip
 SHA-256 f6cdcca82f239fb69b2f820ad9dec07f2f00b423273851b67a0e24bc783acf46
-shadPS4 QtLauncher v224 Windows archive:
-https://github.com/shadps4-emu/shadps4-qtlauncher/releases/download/v224/shadPS4QtLauncher-win64-qt-v224.zip
-SHA-256 021871249bae6867900f62efd728a6cbdbed9934b69c28488b41d413280e2e1d
+shadPS4 QtLauncher 2026-10-02 (4c4e109) Windows archive (optional settings GUI;
+the project deletes superseded builds, so the bootstrap skips it if absent):
+https://github.com/shadps4-emu/shadps4-qtlauncher/releases/download/shadPS4QtLauncher-2026-10-02-4c4e1090ea53dc1ec956fa9954acbf143d104b2e/shadPS4QtLauncher-win64-qt-2026-10-02-4c4e109.zip
+SHA-256 (published by GitHub) 7aaab50f623dfea987ed11e3fa6374c34f5fce988ab0673e4b0ab7216b7fab9f
 
 Eden 0.2.1 Windows amd64 MSVC archive:
 https://stable.eden-emu.dev/v0.2.1/Eden-Windows-v0.2.1-amd64-msvc-standard.zip
@@ -112,16 +113,43 @@ Cxbx-Reloaded CI-585c49a:
 https://github.com/Cxbx-Reloaded/Cxbx-Reloaded/releases/download/CI-585c49a/CxbxReloaded-Release.zip
 Archive SHA-256 (published by GitHub):
 010d1e85bee9f82f05ae57ca483e7ae61fecba06c1637bf6b5a74ca09b03bf43
-This established Xbox HLE route is bundled as a firmware-free alternative to
-xemu. The original Xbox boot/flash ROMs remain relevant only when xemu is
-chosen.
+This Xbox HLE route plays without firmware. Once the owner's MCPX boot ROM
+and flash BIOS are present, PLAY uses xemu instead.
 
 Play! 0.70 Windows x64:
 https://www.purei.org/downloads/play/stable/0.70/Play-x86-64.exe
 SHA-256 d4cd4583694d555771483526b87b7ff29ca42b0fab0693ae69d1189575a56883
-Play! is the installed PS2 HLE fallback. PCSX2 remains available after a user
-adds a console BIOS, but lack of that BIOS no longer blocks the one-click
-launch route.
+Play! is the PS2 route without a BIOS. Once the owner's BIOS is present, PLAY
+uses PCSX2.
+
+PCSX2 2.8.2 (latest stable), the reference PS2 emulator:
+https://github.com/PCSX2/pcsx2/releases/tag/v2.8.2
+Windows: https://github.com/PCSX2/pcsx2/releases/download/v2.8.2/pcsx2-v2.8.2-windows-x64-Qt.7z
+SHA-256 7dfc829ca1994cc1045ac49f05e39b6cf968b72e6a374c40e05c2a2b4ac200b4
+(recorded after retrieval; its updater.exe is not installed)
+Linux: https://github.com/PCSX2/pcsx2/releases/download/v2.8.2/pcsx2-v2.8.2-linux-appimage-x64-Qt.AppImage
+SHA-256 0c46bb6a88aa2782b10853a7b07cf3387ba99cbef2b966372cd2315b8571abea
+License: GPL-3.0
+
+xemu 0.8.136, the reference original-Xbox emulator:
+https://github.com/xemu-project/xemu/releases/tag/v0.8.136
+Windows: https://github.com/xemu-project/xemu/releases/download/v0.8.136/xemu-0.8.136-windows-x86_64.zip
+SHA-256 (published by GitHub) b25a6c24a2c2c36a0843a153cd9ee59ca6833ef87bdcd855ba0824930e4ddd1d
+Linux: https://github.com/xemu-project/xemu/releases/download/v0.8.136/xemu-0.8.136-x86_64.AppImage
+SHA-256 (published by GitHub) ac77363a599109194ba2af3caa695348d199f515cf1d0fde091beb629e0c3103
+Blank formatted Xbox hard disk, xemu-hdd-image 1.0:
+https://github.com/xemu-project/xemu-hdd-image/releases/download/1.0/xbox_hdd.qcow2.zip
+Archive SHA-256 d9f5a4c1224ff24cf9066067bda70cc8b9c874ea22b9c542eb2edbfc4621bb39
+xbox_hdd.qcow2 SHA-256 eb35d069715dfc0d37cfac086a0b73a89a02e8f12519cd8eda82ad479d1a4eed
+License: GPL-2.0
+
+Vita3K build 4115 (a366df69), the PS Vita emulator:
+https://github.com/Vita3K/Vita3K-builds/releases/tag/4115
+Windows: https://github.com/Vita3K/Vita3K-builds/releases/download/4115/vita3k-4115-a366df69-windows-x86_64.7z
+SHA-256 (published by GitHub) 35aead1c59a684f15b30e87cc18cdc34d535bca3873d711fa2ac92d9adb90897
+Linux: https://github.com/Vita3K/Vita3K-builds/releases/download/4115/Vita3K-x86_64.AppImage
+SHA-256 (published by GitHub) ffce3720027ff8cee3505e25b6264eda12c6457f7ba31cecae26a90f87caf48e
+License: GPL-2.0
 
 PS3 system software (private-machine installation)
 --------------------------------------------------
@@ -134,6 +162,22 @@ SHA-256: 158471fd834f8ea8036136b6aab43cd86c7ba73d79ca30e0af3c0fe0001cf365
 The publisher file and installed dev_flash are private bundle state and are not
 committed to the public source repository. The product's INSTALL FIRMWARE
 action fetches and verifies these exact publisher bytes on the user's machine.
+
+PS Vita system software and font package (private-machine installation)
+-------------------------------------------------------------------------
+Sony support page:
+https://www.playstation.com/en-us/support/hardware/psvita/system-software/
+System software 3.74, as that page links it:
+http://dus01.psv.update.playstation.net/update/psv/image/2022_0209/rel_f2c7b12fe85496ec88a0391b514d6e3b/PSVUPDAT.PUP
+Size: 133834240 bytes
+SHA-256: 6ef6dc8da6db026f28647713e473486d770087a605c52a8d751bfca7478386cf
+Font package, from Sony's PS Vita update server:
+http://dus01.psp2.update.playstation.net/update/psp2/image/2022_0209/sd_59dcf059d3328fb67be7e51f8aa33418/PSP2UPDAT.PUP
+Size: 56778752 bytes
+SHA-256: c3c03fc7363dd573d90e5157629bf11551f434b283cc898d9ffc71dd716b791c
+For both, the MD5 embedded in Sony's URL matched before the size and SHA-256
+were recorded. Like the PS3 file, they are fetched and verified on the user's
+machine by INSTALL FIRMWARE and never committed.
 
 Progetto-SNAPS MAME snapshots
 -----------------------------

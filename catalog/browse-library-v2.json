@@ -38339,7 +38339,7 @@
     {
       "id": "homebrew-hub/lacoste42__bomb-runner-1-2",
       "title": "Bomb Runner 1-2",
-      "developer": "RajcsÃ¡nyi LÃ¡szlÃ³ (WLS)",
+      "developer": "Rajcsányi László (WLS)",
       "system": "unknown",
       "kind": "game",
       "tags": [
@@ -41790,7 +41790,7 @@
     },
     {
       "id": "homebrew-hub/detectiveknox",
-      "title": "Detective Knox In: The DoppelgÃ¤nger (Demo)",
+      "title": "Detective Knox In: The Doppelgänger (Demo)",
       "developer": "pcavalcanti",
       "system": "unknown",
       "kind": "game",
@@ -42697,7 +42697,7 @@
     {
       "id": "homebrew-hub/joaobapt__dungeon-master",
       "title": "Dungeon Master",
-      "developer": "JoÃ£o Baptista",
+      "developer": "João Baptista",
       "system": "unknown",
       "kind": "game",
       "tags": [
@@ -47161,8 +47161,8 @@
     },
     {
       "id": "homebrew-hub/lacoste42__gnter-the-monster-and-his-friends",
-      "title": "GÃ¼nter the monster and his friends",
-      "developer": "RajcsÃ¡nyi LÃ¡szlÃ³ (WLS)",
+      "title": "Günter the monster and his friends",
+      "developer": "Rajcsányi László (WLS)",
       "system": "unknown",
       "kind": "game",
       "tags": [
@@ -48756,7 +48756,7 @@
     },
     {
       "id": "homebrew-hub/jayros-gba-video-test-cartridge",
-      "title": "Jayro's GBAâ¢ VIDEO Test Cartridge v1.0",
+      "title": "Jayro's GBA™ VIDEO Test Cartridge v1.0",
       "developer": "Jayro Jones",
       "system": "gba",
       "kind": "game",
@@ -49029,7 +49029,7 @@
     {
       "id": "homebrew-hub/jumpman-86",
       "title": "Jumpman '86",
-      "developer": "PÃƒÂ¤r Johannesson",
+      "developer": "Pär Johannesson",
       "system": "gbc",
       "kind": "game",
       "tags": [],
@@ -50668,7 +50668,7 @@
     {
       "id": "homebrew-hub/lacoste42__mad-monster",
       "title": "Mad Monster",
-      "developer": "RajcsÃ¡nyi LÃ¡szlÃ³ (WLS)",
+      "developer": "Rajcsányi László (WLS)",
       "system": "unknown",
       "kind": "game",
       "tags": [
@@ -53612,7 +53612,7 @@
     {
       "id": "homebrew-hub/packri-monster",
       "title": "Packri Monster",
-      "developer": "Eric LlimÃ³s",
+      "developer": "Eric Llimós",
       "system": "unknown",
       "kind": "game",
       "tags": [
@@ -53752,7 +53752,7 @@
     {
       "id": "homebrew-hub/patrician",
       "title": "Patrician",
-      "developer": "Mahou Shoujo â Magical Moestar, one60hp",
+      "developer": "Mahou Shoujo ☆ Magical Moestar, one60hp",
       "system": "unknown",
       "kind": "game",
       "tags": [
@@ -55167,7 +55167,7 @@
     {
       "id": "homebrew-hub/pushingo",
       "title": "Pushingo",
-      "developer": "RajcsÃ¡nyi LÃ¡szlÃ³ (WLS)",
+      "developer": "Rajcsányi László (WLS)",
       "system": "unknown",
       "kind": "game",
       "tags": [
@@ -55603,7 +55603,7 @@
     },
     {
       "id": "homebrew-hub/rayslinger",
-      "title": "Rayslingerâ¢ (GBC)",
+      "title": "Rayslinger™ (GBC)",
       "developer": "Unicore",
       "system": "unknown",
       "kind": "game",
@@ -55908,7 +55908,7 @@
     {
       "id": "homebrew-hub/retro-otrop-en",
       "title": "Retro Otrop - English Version",
-      "developer": "Iuri GuiÃ£o",
+      "developer": "Iuri Guião",
       "system": "unknown",
       "kind": "game",
       "tags": [
@@ -59481,7 +59481,7 @@
     {
       "id": "homebrew-hub/super-bunny-mission",
       "title": "Super Bunny Mission",
-      "developer": "SÅdoDev",
+      "developer": "SōdoDev",
       "system": "gb",
       "kind": "game",
       "tags": [
@@ -60119,7 +60119,7 @@
     },
     {
       "id": "homebrew-hub/the-adventures-and-misadventures-of-three-friendly-animals-part-4",
-      "title": "The Adventures and Misadventures of Three FriendlyÂ Animals:Â PartÂ 4",
+      "title": "The Adventures and Misadventures of Three Friendly Animals: Part 4",
       "developer": "thincavalcanti",
       "system": "gb",
       "kind": "game",
@@ -61468,7 +61468,7 @@
     {
       "id": "homebrew-hub/together-alone",
       "title": "Together Alone",
-      "developer": "-ã Ê É É n Ê ~ o É á´ u ã-, Miyulake",
+      "developer": "-【 ʎ ɟ ɟ n ʍ ~ o ɔ ᴉ u 】-, Miyulake",
       "system": "gb",
       "kind": "game",
       "tags": [
@@ -63879,7 +63879,7 @@
     },
     {
       "id": "homebrew-hub/ripir-proof-of-concept",
-      "title": "ÊÉªá´Éªá´ [proof of concept]",
+      "title": "ʀɪᴘɪᴙ [proof of concept]",
       "developer": "Elvies",
       "system": "unknown",
       "kind": "game",
@@ -65078,7 +65078,7 @@
       "source_id": "libretro-content",
       "title": "Cave Story (En)",
       "developer": "Community content authors",
-      "system": "ports",
+      "system": "cavestory",
       "kind": "game",
       "tags": [
         "Cave Story",

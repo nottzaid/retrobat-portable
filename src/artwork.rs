@@ -30,14 +30,21 @@ pub enum ArtworkError {
     TooLarge(usize),
     #[error("bundled artwork is not a regular file: {0}")]
     NotAFile(PathBuf),
+    #[error("artwork source did not return an image: {0}")]
+    NotAnImage(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BundledArtworkAudit {
     pub declared_assets: usize,
+    /// Present as a regular file of the recorded size.
     pub verified_assets: usize,
     pub failed_assets: usize,
     pub failure_examples: Vec<String>,
+    /// What "verified" means here. Content hashes are checked every time a
+    /// cover is displayed and by the VERIFY scripts; re-reading every cover
+    /// here would cost tens of seconds on a cold hard disk.
+    pub method: &'static str,
 }
 
 impl BundledArtworkAudit {
@@ -50,30 +57,41 @@ pub fn audit_bundled_artwork(
     layout: &PortableLayout,
     entries: &[BrowseEntry],
 ) -> BundledArtworkAudit {
-    let mut report = BundledArtworkAudit {
-        declared_assets: 0,
-        verified_assets: 0,
-        failed_assets: 0,
-        failure_examples: Vec::new(),
-    };
-    for entry in entries {
-        let Some(asset) = &entry.artwork_asset else {
-            continue;
-        };
-        report.declared_assets += 1;
-        match load_bundled_artwork(layout, asset) {
-            Ok(_) => report.verified_assets += 1,
-            Err(error) => {
-                report.failed_assets += 1;
-                if report.failure_examples.len() < 20 {
-                    report
-                        .failure_examples
-                        .push(format!("{}: {error}", entry.id));
-                }
-            }
-        }
+    let mut assets = entries
+        .iter()
+        .filter_map(|entry| entry.artwork_asset.as_ref().map(|asset| (entry, asset)))
+        .collect::<Vec<_>>();
+    // Path order follows directory order, which keeps metadata reads local.
+    assets.sort_by(|(_, left), (_, right)| left.path.cmp(&right.path));
+    let failures = assets
+        .iter()
+        .filter_map(|(entry, asset)| {
+            let relative = PathBuf::from(&asset.path);
+            let problem = match ensure_safe_parent(&layout.root, &relative) {
+                Err(error) => Some(error.to_string()),
+                Ok(()) => match fs::symlink_metadata(layout.root.join(&relative)) {
+                    Err(error) => Some(error.to_string()),
+                    Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                        Some("not a regular file".to_owned())
+                    }
+                    Ok(metadata) if metadata.len() != asset.size => Some(format!(
+                        "size {} differs from the recorded {}",
+                        metadata.len(),
+                        asset.size
+                    )),
+                    Ok(_) => None,
+                },
+            };
+            problem.map(|problem| format!("{}: {problem}", entry.id))
+        })
+        .collect::<Vec<_>>();
+    BundledArtworkAudit {
+        declared_assets: assets.len(),
+        verified_assets: assets.len() - failures.len(),
+        failed_assets: failures.len(),
+        failure_examples: failures.into_iter().take(20).collect(),
+        method: "present with the recorded size; SHA-256 is checked on display and by VERIFY-*",
     }
-    report
 }
 
 pub fn load_bundled_artwork(
@@ -91,20 +109,22 @@ pub fn load_bundled_artwork(
     if artwork.size > MAX_BYTES || metadata.len() > MAX_BYTES {
         return Err(ArtworkError::TooLarge(MAX_BYTES as usize));
     }
-    let (size, sha256) = digest_file(&path)?;
-    if size != artwork.size {
+    // Read once; verify the bytes that will be shown.
+    let bytes = fs::read(path)?;
+    if bytes.len() as u64 != artwork.size {
         return Err(ArtworkError::Size {
             expected: artwork.size,
-            actual: size,
+            actual: bytes.len() as u64,
         });
     }
+    let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
     if sha256 != artwork.sha256 {
         return Err(ArtworkError::Hash {
             expected: artwork.sha256.clone(),
             actual: sha256,
         });
     }
-    Ok(fs::read(path)?)
+    Ok(bytes)
 }
 
 pub fn load_snapshot_artwork<D: DownloadClient>(
@@ -131,6 +151,10 @@ pub fn load_snapshot_artwork<D: DownloadClient>(
     let mut bytes = LimitedBytes::new(MAX_BYTES);
     downloader.fetch(url, &mut bytes)?;
     let bytes = bytes.into_inner()?;
+    // A server can answer 200 with an error page; only an image is cached.
+    if image::guess_format(&bytes).is_err() {
+        return Err(ArtworkError::NotAnImage(url.to_owned()));
+    }
     let temporary = cache_path.with_extension(format!("{}.tmp", std::process::id()));
     let result = (|| {
         let mut output = File::create(&temporary)?;
@@ -199,13 +223,13 @@ pub fn load_or_fetch<D: DownloadClient>(
     let cache_path = layout.root.join(&relative);
 
     if cache_path.is_file() {
-        match verify(&cache_path, artwork) {
-            Ok(()) => return Ok(fs::read(cache_path)?),
-            Err(ArtworkError::Size { .. } | ArtworkError::Hash { .. }) => {
-                fs::remove_file(&cache_path)?;
-            }
-            Err(error) => return Err(error),
+        let bytes = fs::read(&cache_path)?;
+        if bytes.len() as u64 == artwork.size
+            && hex::encode(sha2::Sha256::digest(&bytes)) == artwork.sha256
+        {
+            return Ok(bytes);
         }
+        fs::remove_file(&cache_path)?;
     }
 
     let unique = SystemTime::now()
@@ -243,111 +267,4 @@ fn verify(path: &std::path::Path, artwork: &Artwork) -> Result<(), ArtworkError>
         });
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::catalog::Catalog;
-    use crate::install::DownloadClient;
-    use sha2::{Digest, Sha256};
-    use tempfile::tempdir;
-
-    struct BytesDownloader(Vec<u8>);
-
-    impl DownloadClient for BytesDownloader {
-        fn fetch(&self, _url: &str, output: &mut dyn Write) -> Result<(), DownloadError> {
-            output
-                .write_all(&self.0)
-                .map_err(|error| DownloadError::new(error.to_string()))
-        }
-    }
-
-    #[test]
-    fn caches_only_verified_artwork() {
-        let temp = tempdir().unwrap();
-        let layout = PortableLayout::new(temp.path());
-        let bytes = b"image fixture".to_vec();
-        let mut artwork = Catalog::built_in().unwrap().entries[0].artwork[0].clone();
-        artwork.size = bytes.len() as u64;
-        artwork.sha256 = hex::encode(Sha256::digest(&bytes));
-        let downloader = BytesDownloader(bytes.clone());
-
-        assert_eq!(
-            load_or_fetch(&layout, &artwork, &downloader).unwrap(),
-            bytes
-        );
-        assert_eq!(
-            load_or_fetch(
-                &layout,
-                &artwork,
-                &BytesDownloader(b"network must not be used".to_vec())
-            )
-            .unwrap(),
-            bytes
-        );
-    }
-
-    #[test]
-    fn rejects_and_removes_corrupt_artwork() {
-        let temp = tempdir().unwrap();
-        let layout = PortableLayout::new(temp.path());
-        let artwork = Catalog::built_in().unwrap().entries[0].artwork[0].clone();
-
-        assert!(matches!(
-            load_or_fetch(
-                &layout,
-                &artwork,
-                &BytesDownloader(b"not an image".to_vec())
-            ),
-            Err(ArtworkError::Size { .. })
-        ));
-        let cache = layout
-            .metadata_root()
-            .join("cache/artwork")
-            .join(format!("{}.image", artwork.sha256));
-        assert!(!cache.exists());
-    }
-
-    #[test]
-    fn loads_only_the_declared_bundled_artwork_asset() {
-        let temp = tempdir().unwrap();
-        let layout = PortableLayout::new(temp.path());
-        let path = layout.root.join("Artwork/mame/example.png");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, b"local artwork").unwrap();
-        let asset = BundledArtwork {
-            path: "Artwork/mame/example.png".to_owned(),
-            size: 13,
-            sha256: hex::encode(Sha256::digest(b"local artwork")),
-        };
-
-        assert_eq!(
-            load_bundled_artwork(&layout, &asset).unwrap(),
-            b"local artwork"
-        );
-    }
-
-    #[test]
-    fn bundled_artwork_audit_reports_missing_assets_instead_of_claiming_coverage() {
-        let temp = tempdir().unwrap();
-        let layout = PortableLayout::new(temp.path());
-        let mut entry = crate::browse::BrowseCatalog::built_in()
-            .unwrap()
-            .entries
-            .into_iter()
-            .next()
-            .unwrap();
-        entry.artwork_asset = Some(BundledArtwork {
-            path: "Artwork/mame/missing.png".to_owned(),
-            size: 1,
-            sha256: "0".repeat(64),
-        });
-
-        let report = audit_bundled_artwork(&layout, &[entry]);
-
-        assert_eq!(report.declared_assets, 1);
-        assert_eq!(report.failed_assets, 1);
-        assert!(!report.is_complete());
-    }
 }

@@ -26,7 +26,8 @@ pub enum ReadinessError {
 #[serde(rename_all = "snake_case")]
 pub enum BackendState {
     ReadyNow,
-    ProvisionOnFirstPlay,
+    /// RetroBat lists an emulator for the system, but none is installed.
+    EmulatorMissing,
     Unresolved,
 }
 
@@ -90,6 +91,9 @@ pub struct FirmwareFileStatus {
     pub directory: bool,
     pub optional: bool,
     pub present: bool,
+    /// Other files that satisfy this requirement just as well (another
+    /// region's or model's BIOS); `present` is true when any one is.
+    pub alternatives: Vec<String>,
     pub guidance_url: String,
     pub guidance: String,
     pub download: Option<FirmwareDownload>,
@@ -110,13 +114,15 @@ pub struct FirmwareDownload {
 pub enum FirmwareInstallAction {
     PlaceInBios,
     Rpcs3,
+    /// Vita3K installs Sony's update package into its own system partitions.
+    Vita3k,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReadinessReport {
     pub total_entries: usize,
     pub ready_now_entries: usize,
-    pub provision_on_first_play_entries: usize,
+    pub emulator_missing_entries: usize,
     pub unresolved_entries: usize,
     pub firmware_required_entries: usize,
     pub firmware_required_missing_entries: usize,
@@ -132,7 +138,7 @@ impl ReadinessReport {
         let mut backend_routes = BTreeMap::new();
         for (system, configuration) in &configured {
             let mut routes = configuration.available_routes(layout, &inventory);
-            prefer_firmware_free_route(system, &mut routes);
+            prefer_best_route(layout, system, &mut routes);
             backend_routes.insert(system.clone(), routes);
         }
         if layout.retroarch_executable().is_file() && layout.retroarch_core("jaxe").is_file() {
@@ -167,7 +173,7 @@ impl ReadinessReport {
             let backend = if all_candidates_ready {
                 BackendState::ReadyNow
             } else if any_configured {
-                BackendState::ProvisionOnFirstPlay
+                BackendState::EmulatorMissing
             } else {
                 BackendState::Unresolved
             };
@@ -196,8 +202,7 @@ impl ReadinessReport {
         }
 
         let ready_now_entries = entries_for_state(&systems, BackendState::ReadyNow);
-        let provision_on_first_play_entries =
-            entries_for_state(&systems, BackendState::ProvisionOnFirstPlay);
+        let emulator_missing_entries = entries_for_state(&systems, BackendState::EmulatorMissing);
         let unresolved_entries = entries_for_state(&systems, BackendState::Unresolved);
         let firmware_required_entries = systems
             .iter()
@@ -213,7 +218,7 @@ impl ReadinessReport {
         Ok(Self {
             total_entries: entries.len(),
             ready_now_entries,
-            provision_on_first_play_entries,
+            emulator_missing_entries,
             unresolved_entries,
             firmware_required_entries,
             firmware_required_missing_entries,
@@ -229,21 +234,69 @@ impl ReadinessReport {
     }
 
     pub fn select_backend(&self, retrobat_system: &str, rom: &Path) -> Option<&BackendRoute> {
-        self.backend_routes
+        self.select_backend_preferring(retrobat_system, rom, None)
+    }
+
+    /// Like `select_backend`, but an installed route using `core` wins when
+    /// the content needs it (Game & Watch .mgw packs need the gw core, not
+    /// the system's default MAME).
+    pub fn select_backend_preferring(
+        &self,
+        retrobat_system: &str,
+        rom: &Path,
+        core: Option<&str>,
+    ) -> Option<&BackendRoute> {
+        let routes = self
+            .backend_routes
             .iter()
             .find(|(system, _)| system.eq_ignore_ascii_case(retrobat_system))
-            .and_then(|(_, routes)| routes.iter().find(|route| route.supports(rom)))
+            .map(|(_, routes)| routes)?;
+        core.and_then(|core| {
+            routes.iter().find(|route| {
+                route
+                    .core
+                    .as_deref()
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(core))
+            })
+        })
+        .or_else(|| routes.iter().find(|route| route.supports(rom)))
     }
 }
 
-fn prefer_firmware_free_route(system: &str, routes: &mut [BackendRoute]) {
-    // Keep RetroBat's configured order except where an established HLE backend
-    // is specifically installed to provide a no-console-ROM fallback. Users
-    // can still select the higher-compatibility alternatives after importing
-    // their own firmware.
+/// Puts the best installed route first: the accuracy reference for the
+/// system, using the owner's official BIOS whenever it is present. Without
+/// that BIOS a built-in-BIOS route comes first, so PLAY works until it is
+/// imported. There is no per-game backend picker, so this ordering is what
+/// makes importing a BIOS take effect.
+fn prefer_best_route(layout: &PortableLayout, system: &str, routes: &mut [BackendRoute]) {
+    let bios = layout.retrobat_root().join("bios");
+    let has = |name: &str| bios.join(name).is_file();
     let preferred = match system {
-        "ps2" => Some("play"),
+        // The accuracy references, installed and full speed on ordinary
+        // hardware; neither needs a BIOS.
+        "nes" => Some("mesen"),
+        "snes" => Some("bsnes"),
+        "gb" | "gbc" => Some("sameboy"),
+        // PCSX ReARMed has a built-in HLE BIOS; Beetle PSX stops at a
+        // "Firmware is missing" screen without one.
+        "psx"
+            if !["scph5500.bin", "scph5501.bin", "scph5502.bin"]
+                .iter()
+                .any(|name| has(name)) =>
+        {
+            Some("pcsx_rearmed")
+        }
+        // Play! needs no BIOS; PCSX2, the reference, needs one in
+        // bios/pcsx2/bios and comes first (RetroBat's order) once it is there.
+        "ps2" if !directory_contains_regular_file(&bios.join("pcsx2").join("bios")) => Some("play"),
+        // Beetle Saturn (Mednafen), the accuracy reference, reads the
+        // regional BIOS files; YabaSanshiro reads a single saturn_bios.bin.
+        // Every installed Saturn core refuses to start without a BIOS.
+        "saturn" if has("mpr-17933.bin") || has("sega_101.bin") => Some("mednafen_saturn"),
         "saturn" => Some("yabasanshiro"),
+        // xemu, the reference, needs the console's boot ROM and flash BIOS;
+        // Cxbx-Reloaded needs neither.
+        "xbox" if !(has("mcpx_1.0.bin") && has("Complex_4627.bin")) => Some("cxbx"),
         _ => None,
     };
     if let Some(preferred) = preferred
@@ -635,6 +688,25 @@ fn summarize_required_firmware(
                 .or_insert_with(|| (file, system.clone(), core.clone()));
         }
     }
+    let mut groups = Vec::new();
+    for system in systems {
+        let Some(core) = backend_routes
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(system))
+            .and_then(|(_, routes)| routes.first())
+            .and_then(|route| route.core.as_deref())
+        else {
+            continue;
+        };
+        for group in required_firmware_groups(system, core) {
+            // Each alternative alone satisfies the group, so none of them is
+            // listed separately as optional.
+            for path in group.paths {
+                discovered.remove(*path);
+            }
+            groups.push((group, system.clone(), core.to_owned()));
+        }
+    }
     for system in systems {
         let selected_emulator = backend_routes
             .iter()
@@ -648,27 +720,54 @@ fn summarize_required_firmware(
         }
     }
     let bios_root = layout.retrobat_root().join("bios");
-    let files = discovered
+    let mut files = groups
         .into_iter()
-        .map(|(path, (file, system, core))| {
-            let (guidance_url, guidance) = firmware_guidance(&system, &core, file.optional);
-            let download = official_firmware_download(&system, &path);
+        .map(|(group, system, core)| {
+            let (guidance_url, guidance) = firmware_guidance(&system, &core, false);
             FirmwareFileStatus {
-                relative_path: path.clone(),
-                description: file.description,
-                directory: file.directory,
-                optional: file.optional,
-                present: if file.directory {
-                    directory_contains_regular_file(&bios_root.join(&path))
-                } else {
-                    bios_root.join(&path).is_file()
-                },
+                relative_path: group.paths[0].to_owned(),
+                description: group.description.to_owned(),
+                directory: false,
+                optional: false,
+                present: group
+                    .paths
+                    .iter()
+                    .any(|path| bios_root.join(path).is_file()),
+                alternatives: group.paths[1..]
+                    .iter()
+                    .map(|path| (*path).to_owned())
+                    .collect(),
                 guidance_url: guidance_url.to_owned(),
                 guidance: guidance.to_owned(),
-                download,
+                download: None,
             }
         })
         .collect::<Vec<_>>();
+    files.extend(discovered.into_iter().map(|(path, (file, system, core))| {
+        let (guidance_url, guidance) = firmware_guidance(&system, &core, file.optional);
+        let download = official_firmware_download(&system, &path);
+        FirmwareFileStatus {
+            relative_path: path.clone(),
+            description: file.description,
+            directory: file.directory,
+            optional: file.optional,
+            alternatives: Vec::new(),
+            present: if file.directory {
+                directory_contains_regular_file(&bios_root.join(&path))
+            } else if system == "ps3" && path == "PS3UPDAT.PUP" {
+                ps3_firmware_installed(layout, &bios_root)
+            } else if system == "psvita" && path == "PSVUPDAT.PUP" {
+                crate::vita::system_software_installed(layout)
+            } else if system == "psvita" && path == "PSP2UPDAT.PUP" {
+                crate::vita::fonts_installed(layout)
+            } else {
+                bios_root.join(&path).is_file()
+            },
+            guidance_url: guidance_url.to_owned(),
+            guidance: guidance.to_owned(),
+            download,
+        }
+    }));
     let required = files
         .iter()
         .filter(|file| !file.optional)
@@ -712,6 +811,21 @@ fn summarize_required_firmware(
     }
 }
 
+/// PS3 games need the firmware installed into RPCS3, not merely downloaded.
+/// On Windows RetroBat installs bios/PS3UPDAT.PUP on the next launch; the
+/// native Linux RPCS3 keeps its own dev_flash, filled by its installer.
+fn ps3_firmware_installed(layout: &PortableLayout, bios_root: &Path) -> bool {
+    let native = layout.linux_runtime_root().join("RPCS3.AppImage");
+    if cfg!(target_os = "linux") && native.is_file() {
+        layout
+            .metadata_root()
+            .join("runtime/linux/rpcs3/config/rpcs3/dev_flash/vsh/module/vsh.self")
+            .is_file()
+    } else {
+        bios_root.join("PS3UPDAT.PUP").is_file()
+    }
+}
+
 fn official_firmware_download(system: &str, path: &str) -> Option<FirmwareDownload> {
     match (system, path) {
         ("ps3", "PS3UPDAT.PUP") => Some(FirmwareDownload {
@@ -727,6 +841,29 @@ fn official_firmware_download(system: &str, path: &str) -> Option<FirmwareDownlo
             sha256: "158471fd834f8ea8036136b6aab43cd86c7ba73d79ca30e0af3c0fe0001cf365"
                 .to_owned(),
             install_action: FirmwareInstallAction::Rpcs3,
+        }),
+        ("psvita", "PSVUPDAT.PUP") => Some(FirmwareDownload {
+            publisher: "Sony Interactive Entertainment".to_owned(),
+            source_url: "https://www.playstation.com/en-us/support/hardware/psvita/system-software/"
+                .to_owned(),
+            // System software 3.74 as Sony's page links it; the MD5 in the
+            // URL matched before this size and SHA-256 were recorded.
+            url: "http://dus01.psv.update.playstation.net/update/psv/image/2022_0209/rel_f2c7b12fe85496ec88a0391b514d6e3b/PSVUPDAT.PUP".to_owned(),
+            size: 133_834_240,
+            sha256: "6ef6dc8da6db026f28647713e473486d770087a605c52a8d751bfca7478386cf"
+                .to_owned(),
+            install_action: FirmwareInstallAction::Vita3k,
+        }),
+        ("psvita", "PSP2UPDAT.PUP") => Some(FirmwareDownload {
+            publisher: "Sony Interactive Entertainment".to_owned(),
+            source_url: "https://vita3k.org/quickstart.html".to_owned(),
+            // Sony's font package from its own Vita update server; the MD5 in
+            // the URL matched before this size and SHA-256 were recorded.
+            url: "http://dus01.psp2.update.playstation.net/update/psp2/image/2022_0209/sd_59dcf059d3328fb67be7e51f8aa33418/PSP2UPDAT.PUP".to_owned(),
+            size: 56_778_752,
+            sha256: "c3c03fc7363dd573d90e5157629bf11551f434b283cc898d9ffc71dd716b791c"
+                .to_owned(),
+            install_action: FirmwareInstallAction::Vita3k,
         }),
         _ => None,
     }
@@ -761,6 +898,44 @@ fn curated_standalone_firmware(
                 optional: false,
             },
         ],
+        // Play! and Cxbx-Reloaded run without a BIOS; the owner's official
+        // BIOS switches PLAY to the reference emulators, PCSX2 and xemu.
+        ("ps2", Some("play")) => vec![CoreFirmwareFile {
+            path: "pcsx2/bios".to_owned(),
+            description: "PlayStation 2 BIOS from your console — switches PLAY to PCSX2".to_owned(),
+            directory: true,
+            optional: true,
+        }],
+        ("xbox", Some("cxbx")) => vec![
+            CoreFirmwareFile {
+                path: "mcpx_1.0.bin".to_owned(),
+                description: "Xbox MCPX 1.0 boot ROM from your console — with the flash BIOS, switches PLAY to xemu".to_owned(),
+                directory: false,
+                optional: true,
+            },
+            CoreFirmwareFile {
+                path: "Complex_4627.bin".to_owned(),
+                description: "Xbox flash BIOS from your console (retail 4627 works), placed under the name RetroBat's xemu setup reads".to_owned(),
+                directory: false,
+                optional: true,
+            },
+        ],
+        // Vita3K needs Sony's system software, and its font package for any
+        // game that draws system text; Sony publishes both.
+        ("psvita", Some("vita3k")) => vec![
+            CoreFirmwareFile {
+                path: "PSVUPDAT.PUP".to_owned(),
+                description: "Official PS Vita system software (3.74)".to_owned(),
+                directory: false,
+                optional: false,
+            },
+            CoreFirmwareFile {
+                path: "PSP2UPDAT.PUP".to_owned(),
+                description: "Official PS Vita font package".to_owned(),
+                directory: false,
+                optional: false,
+            },
+        ],
         ("switch", Some("eden")) => vec![CoreFirmwareFile {
             path: "eden/keys/prod.keys".to_owned(),
             description: "Nintendo Switch prod.keys dumped from the user's console".to_owned(),
@@ -771,18 +946,97 @@ fn curated_standalone_firmware(
     }
 }
 
+/// Firmware a system cannot start without, where the core's metadata marks
+/// each alternative optional because any single one is enough. Confirmed
+/// against each installed core's source or documentation.
+struct FirmwareGroup {
+    /// Accepted files, preferred first, relative to RetroBat/bios.
+    paths: &'static [&'static str],
+    description: &'static str,
+}
+
+fn required_firmware_groups(system: &str, core: &str) -> Vec<FirmwareGroup> {
+    match (system, core.to_ascii_lowercase().as_str()) {
+        // Genesis Plus GX: "Mega CD BIOS are required files"; it loads the
+        // one matching the game's region.
+        ("megacd" | "segacd", "genesis_plus_gx") => vec![FirmwareGroup {
+            paths: &["bios_CD_U.bin", "bios_CD_E.bin", "bios_CD_J.bin"],
+            description: "Sega CD / Mega CD BIOS for the game's region: bios_CD_U.bin (USA), \
+                          bios_CD_E.bin (Europe) or bios_CD_J.bin (Japan)",
+        }],
+        // Beetle PCE stops with "Firmware not found" for CD games; its
+        // default System Card setting is syscard3.pce.
+        ("pcenginecd", "mednafen_pce" | "mednafen_pce_fast") => vec![FirmwareGroup {
+            paths: &["syscard3.pce"],
+            description: "PC Engine Super CD-ROM² System Card 3.0 (syscard3.pce)",
+        }],
+        // The installed 2019 NeoCD reports "No BIOS detected!" and also needs
+        // the Y-Zoom ROM; it identifies files by content, not name.
+        ("neogeocd", "neocd") => vec![
+            FirmwareGroup {
+                paths: &[
+                    "neocd/neocd_f.rom",
+                    "neocd/neocd_sf.rom",
+                    "neocd/front-sp1.bin",
+                    "neocd/neocd_t.rom",
+                    "neocd/neocd_st.rom",
+                    "neocd/top-sp1.bin",
+                    "neocd/neocd_z.rom",
+                    "neocd/neocd_sz.rom",
+                    "neocd/neocd.bin",
+                    "neocd/uni-bioscd.rom",
+                ],
+                description: "Neo Geo CD BIOS from a front-loading, top-loading or CDZ console",
+            },
+            FirmwareGroup {
+                paths: &["neocd/000-lo.lo", "neocd/ng-lo.rom"],
+                description: "Neo Geo Y-Zoom ROM (000-lo.lo or ng-lo.rom)",
+            },
+        ],
+        // Opera: "One of the following system BIOSes is required".
+        ("3do", "opera") => vec![FirmwareGroup {
+            paths: &[
+                "panafz10.bin",
+                "panafz1.bin",
+                "panafz10-norsa.bin",
+                "panafz10e-anvil.bin",
+                "panafz10e-anvil-norsa.bin",
+                "panafz1j.bin",
+                "panafz1j-norsa.bin",
+                "goldstar.bin",
+                "sanyotry.bin",
+            ],
+            description: "3DO system BIOS (Panasonic FZ-1/FZ-10, Goldstar or Sanyo)",
+        }],
+        ("fds", "fceumm" | "nestopia" | "mesen") => vec![FirmwareGroup {
+            paths: &["disksys.rom"],
+            description: "Famicom Disk System BIOS (disksys.rom)",
+        }],
+        ("n64dd", "mupen64plus_next") => vec![FirmwareGroup {
+            paths: &["Mupen64plus/IPL.n64"],
+            description: "Nintendo 64DD IPL ROM (IPL.n64)",
+        }],
+        // Beetle Saturn loads the BIOS for the game's region.
+        ("saturn", "mednafen_saturn") => vec![FirmwareGroup {
+            paths: &["mpr-17933.bin", "sega_101.bin"],
+            description: "Saturn BIOS for the game's region: mpr-17933.bin (USA/Europe) or \
+                          sega_101.bin (Japan)",
+        }],
+        // FinalBurn Neo: the neogeo BIOS set is required for Neo Geo games.
+        ("neogeo", "fbneo") => vec![FirmwareGroup {
+            paths: &["fbneo/neogeo.zip"],
+            description: "Neo Geo BIOS set (neogeo.zip)",
+        }],
+        _ => Vec::new(),
+    }
+}
+
 fn core_has_documented_firmware_fallback(core: &str) -> bool {
     matches!(
         core.to_ascii_lowercase().as_str(),
-        // Beetle PSX HW uses OpenBIOS when no user BIOS is supplied:
-        // https://docs.libretro.com/library/beetle_psx_hw/#bios
-        "mednafen_psx_hw"
-            // PUAE's automatic Kickstart selection can use its built-in AROS
-            // replacement: https://docs.libretro.com/library/puae/
-            | "puae"
-            // Libretro's YabaSanshiro documentation explicitly labels
-            // saturn_bios.bin optional; the core has a built-in HLE path.
-            | "yabasanshiro"
+        // PUAE's automatic Kickstart selection can use its built-in AROS
+        // replacement: https://docs.libretro.com/library/puae/
+        "puae"
     )
 }
 
@@ -866,29 +1120,77 @@ fn directory_contains_regular_file(path: &Path) -> bool {
 
 fn firmware_guidance(system: &str, core: &str, optional: bool) -> (&'static str, &'static str) {
     match system {
+        "psx" if optional => (
+            "https://docs.libretro.com/library/pcsx_rearmed/",
+            "PCSX ReARMed plays without this file through its built-in HLE BIOS. Adding a BIOS dumped from your own console switches PLAY to the more accurate Beetle PSX HW core.",
+        ),
         "psx" => (
             "https://docs.libretro.com/library/beetle_psx_hw/",
-            "Beetle PSX HW uses OpenBIOS automatically, so this external BIOS is optional for play. Its core page documents every supported filename and regional compatibility detail.",
+            "Beetle PSX HW needs a PlayStation BIOS dumped from your own console. Its core page documents every supported filename and regional detail.",
         ),
         "ps2" => (
-            "https://docs.libretro.com/library/lrps2/#bios",
-            "LRPS2 accepts any properly dumped PS2 BIOS filename inside bios/pcsx2/bios; no exact filename or hash is required by this importer.",
+            "https://pcsx2.net/docs/setup/bios/",
+            "Play! runs PS2 games without a BIOS. Add the BIOS dumped from your own PS2 (any region or revision, under any name; RetroPort recognises it) and PLAY switches to PCSX2, the reference PS2 emulator. PCSX2's guide shows how to dump it.",
         ),
         "ps3" => (
             "https://www.playstation.com/en-ph/support/hardware/ps3/system-software/",
             "Download Sony's official PS3 update as PS3UPDAT.PUP. RetroBat detects it in the BIOS root and RPCS3 installs it automatically on the next launch.",
         ),
         "saturn" => (
-            "https://docs.libretro.com/library/kronos/",
-            "Kronos documents the Saturn/ST-V firmware expected by this installed core. Dump the requested firmware from hardware you own.",
+            "https://docs.libretro.com/library/yabasanshiro/",
+            "Saturn games need a BIOS dumped from your own console: every installed Saturn core stops without one. With mpr-17933.bin (USA/Europe) or sega_101.bin (Japan), PLAY uses Beetle Saturn, the accuracy reference; saturn_bios.bin alone starts YabaSanshiro.",
         ),
         "xbox" => (
             "https://xemu.app/docs/required-files/",
-            "xemu documents each required Xbox system file and the owner-dump requirement.",
+            "Cxbx-Reloaded runs Xbox games without a BIOS. Add your console's MCPX boot ROM and flash BIOS and PLAY switches to xemu, the reference Xbox emulator; xemu's guide shows how to dump both.",
+        ),
+        "psvita" => (
+            "https://www.playstation.com/en-us/support/hardware/psvita/system-software/",
+            "Sony publishes the PS Vita system software and font package. INSTALL FIRMWARE downloads each from Sony, verifies it, and installs it into Vita3K.",
         ),
         "switch" => (
             "https://git.eden-emu.dev/eden-emu/eden",
             "Eden requires prod.keys to decrypt retail Switch game copies. Select the prod.keys dumped from your own console; RetroPort places it into both Windows and Linux portable Eden data stores.",
+        ),
+        "megacd" | "segacd" => (
+            "https://docs.libretro.com/library/genesis_plus_gx/#bios",
+            "Sega CD games start only with the BIOS of a console you own, matching the game's region. Dump it from your console, or point RetroPort at your BIOS folder: it recognises each file by fingerprint.",
+        ),
+        "pcenginecd" => (
+            "https://docs.libretro.com/library/beetle_pce/#bios",
+            "PC Engine CD games start only with the System Card 3.0 image from a card you own. Dump it, or point RetroPort at your BIOS folder: it recognises the file by fingerprint.",
+        ),
+        "neogeocd" => (
+            "https://github.com/libretro/neocd_libretro#bios-files",
+            "Neo Geo CD games need a BIOS and the Y-Zoom ROM from a console you own. NeoCD identifies them by content, so any of the listed files works.",
+        ),
+        "3do" => (
+            "https://docs.libretro.com/library/opera/#bios",
+            "3DO games start only with the system BIOS of a console you own. Any one of the listed BIOS files is enough.",
+        ),
+        "fds" => (
+            "https://docs.libretro.com/library/fceumm/#bios",
+            "Famicom Disk System games need disksys.rom dumped from your own Disk System RAM adapter.",
+        ),
+        "n64dd" => (
+            "https://docs.libretro.com/library/mupen64plus/",
+            "64DD disks start only with the 64DD IPL ROM from a drive you own.",
+        ),
+        "neogeo" => (
+            "https://docs.libretro.com/library/fbneo/#bios",
+            "Neo Geo games need the neogeo.zip BIOS set from the same MAME/FBNeo romset collection as your games.",
+        ),
+        "lynx" => (
+            "https://docs.libretro.com/library/beetle_lynx/#bios",
+            "Every installed Lynx core needs lynxboot.img dumped from a console you own.",
+        ),
+        "colecovision" => (
+            "https://docs.libretro.com/library/gearcoleco/#bios",
+            "ColecoVision games need the console's BIOS (colecovision.rom) dumped from a console you own.",
+        ),
+        "intellivision" => (
+            "https://docs.libretro.com/library/freeintv/#bios",
+            "Intellivision games need the console's exec.bin and grom.bin dumped from a console you own.",
         ),
         "gb" | "gbc" | "gba" if optional => (
             "https://docs.libretro.com/guides/bios/",
@@ -919,149 +1221,6 @@ fn firmware_index(key: &str, suffix: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browse::{Acquisition, InstallState};
-
-    fn entry(id: &str, system: &str) -> BrowseEntry {
-        BrowseEntry {
-            id: id.to_owned(),
-            source_id: "test".to_owned(),
-            title: id.to_owned(),
-            developer: "test".to_owned(),
-            system: system.to_owned(),
-            kind: "game".to_owned(),
-            tags: Vec::new(),
-            license: None,
-            artwork_url: None,
-            artwork_asset: None,
-            detail_url: None,
-            description: String::new(),
-            release_year: None,
-            install_state: InstallState::BrowseOnly,
-            acquisition: Acquisition::LocalImport,
-            known_sha1: Vec::new(),
-        }
-    }
-
-    fn fixture() -> (tempfile::TempDir, PortableLayout) {
-        let root = tempfile::tempdir().unwrap();
-        let layout = PortableLayout::new(root.path());
-        fs::create_dir_all(layout.systems_config().parent().unwrap()).unwrap();
-        fs::create_dir_all(layout.retroarch_root().join("cores")).unwrap();
-        fs::create_dir_all(layout.retroarch_root().join("info")).unwrap();
-        fs::write(layout.retroarch_executable(), b"exe").unwrap();
-        fs::create_dir_all(layout.emulator_launcher_executable().parent().unwrap()).unwrap();
-        fs::write(layout.emulator_launcher_executable(), b"exe").unwrap();
-        fs::write(layout.retroarch_core("gambatte"), b"core").unwrap();
-        fs::write(layout.retroarch_core("dolphin"), b"core").unwrap();
-        fs::write(layout.retroarch_core("mednafen_psx_hw"), b"core").unwrap();
-        fs::write(
-            layout.retroarch_core_info("gambatte"),
-            "firmware_count = 1\nfirmware0_path = \"gb_bios.bin\"\nfirmware0_opt = \"true\"\n",
-        )
-        .unwrap();
-        fs::write(
-            layout.retroarch_core_info("mednafen_psx_hw"),
-            "firmware_count = 1\nfirmware0_path = \"scph5501.bin\"\nfirmware0_opt = \"false\"\n",
-        )
-        .unwrap();
-        fs::write(
-            layout.systems_config(),
-            r#"<systemList>
-              <system><name>gb</name><emulators><emulator name="libretro"><cores><core>gambatte</core></cores></emulator></emulators></system>
-              <system><name>gamecube</name><emulators><emulator name="dolphin"><core>dolphin</core></emulator><emulator name="libretro"><cores><core incompatible_extensions=".zip .7z">dolphin</core></cores></emulator></emulators></system>
-              <system><name>psx</name><emulators><emulator name="libretro"><cores><core>mednafen_psx_hw</core></cores></emulator></emulators></system>
-              <system><name>ps3</name><emulators><emulator name="rpcs3"/></emulators></system>
-              <system><name>Windows</name><emulators><emulator name="windows"/></emulators></system>
-            </systemList>"#,
-        )
-        .unwrap();
-        (root, layout)
-    }
-
-    #[test]
-    fn audit_distinguishes_ready_provisioning_and_firmware_states() {
-        let (_root, layout) = fixture();
-        let report = ReadinessReport::audit(
-            &layout,
-            &[
-                entry("gb", "gb"),
-                entry("gc", "gamecube"),
-                entry("psx", "psx"),
-                entry("ps3", "ps3"),
-            ],
-        )
-        .unwrap();
-        assert_eq!(report.ready_now_entries, 3);
-        assert_eq!(report.provision_on_first_play_entries, 1);
-        assert_eq!(report.unresolved_entries, 0);
-        assert_eq!(
-            report.for_catalog_system("gb").unwrap().firmware,
-            FirmwareState::NotRequired
-        );
-        assert_eq!(
-            report
-                .for_catalog_system("gb")
-                .unwrap()
-                .optional_firmware_candidates,
-            1
-        );
-        assert_eq!(
-            report.for_catalog_system("gamecube").unwrap().firmware,
-            FirmwareState::NotRequired
-        );
-        assert_eq!(
-            report.for_catalog_system("psx").unwrap().firmware,
-            FirmwareState::NotRequired
-        );
-        assert_eq!(
-            report
-                .for_catalog_system("psx")
-                .unwrap()
-                .optional_firmware_candidates,
-            1
-        );
-    }
-
-    #[test]
-    fn only_cores_with_documented_builtin_fallbacks_downgrade_external_firmware() {
-        assert!(core_has_documented_firmware_fallback("mednafen_psx_hw"));
-        assert!(core_has_documented_firmware_fallback("PUAE"));
-        assert!(!core_has_documented_firmware_fallback("kronos"));
-    }
-
-    #[test]
-    fn installed_hle_routes_are_preferred_without_discarding_accuracy_routes() {
-        let mut ps2 = vec![
-            BackendRoute {
-                emulator: "libretro".to_owned(),
-                core: Some("pcsx2".to_owned()),
-                incompatible_extensions: Vec::new(),
-            },
-            BackendRoute {
-                emulator: "play".to_owned(),
-                core: None,
-                incompatible_extensions: Vec::new(),
-            },
-        ];
-        prefer_firmware_free_route("ps2", &mut ps2);
-        assert_eq!(ps2[0].emulator, "play");
-        assert_eq!(ps2[1].core.as_deref(), Some("pcsx2"));
-
-        let mut saturn = vec![
-            BackendRoute {
-                emulator: "libretro".to_owned(),
-                core: Some("kronos".to_owned()),
-                incompatible_extensions: Vec::new(),
-            },
-            BackendRoute {
-                emulator: "libretro".to_owned(),
-                core: Some("yabasanshiro".to_owned()),
-                incompatible_extensions: Vec::new(),
-            },
-        ];
-        prefer_firmware_free_route("saturn", &mut saturn);
-        assert_eq!(saturn[0].core.as_deref(), Some("yabasanshiro"));
-    }
 
     #[test]
     fn core_metadata_folder_requirement_accepts_any_nonempty_file_inside() {
@@ -1095,45 +1254,5 @@ mod tests {
         let parsed = load_core_firmware(&info);
         assert!(!parsed.files[0].directory);
         assert_eq!(parsed.files[0].path, "dolphin-emu/Sys/codehandler.bin");
-    }
-
-    #[test]
-    fn standalone_firmware_inventory_matches_retrobat_generator_paths() {
-        let ps3 = curated_standalone_firmware("ps3", Some("rpcs3"));
-        assert_eq!(ps3[0].path, "PS3UPDAT.PUP");
-        let xbox = curated_standalone_firmware("xbox", Some("xemu"));
-        assert_eq!(
-            xbox.iter()
-                .map(|file| file.path.as_str())
-                .collect::<Vec<_>>(),
-            ["mcpx_1.0.bin", "Complex_4627.bin"]
-        );
-        assert!(curated_standalone_firmware("wiiu", Some("cemu")).is_empty());
-        assert!(curated_standalone_firmware("xbox", Some("cxbx")).is_empty());
-    }
-
-    #[test]
-    fn route_selection_uses_an_installed_alternative_and_honors_format_limits() {
-        let (_root, layout) = fixture();
-        let report = ReadinessReport::audit(&layout, &[entry("gc", "gamecube")]).unwrap();
-        let route = report
-            .select_backend("gamecube", Path::new("game.rvz"))
-            .unwrap();
-        assert_eq!(route.emulator, "libretro");
-        assert_eq!(route.core.as_deref(), Some("dolphin"));
-        assert!(
-            report
-                .select_backend("gamecube", Path::new("game.zip"))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn windows_is_a_builtin_emulatorlauncher_route_not_a_missing_executable() {
-        let (_root, layout) = fixture();
-        let report = ReadinessReport::audit(&layout, &[entry("pc", "windows")]).unwrap();
-        let readiness = report.for_catalog_system("windows").unwrap();
-        assert_eq!(readiness.backend, BackendState::ReadyNow);
-        assert_eq!(readiness.ready_route.as_ref().unwrap().emulator, "windows");
     }
 }

@@ -103,6 +103,20 @@ impl PortableLayout {
         self.metadata_root().join("imported")
     }
 
+    /// Where an imported disc image is unpacked for an emulator that cannot
+    /// read its format (an Xbox image for Cxbx-Reloaded, a gzip-compressed
+    /// PS2 image for Play!). It is derived from the image's path, so REMOVE
+    /// finds it again.
+    pub fn unpacked_disc(&self, image: &Path) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let relative = image.strip_prefix(&self.root).unwrap_or(image);
+        let digest = Sha256::digest(relative.to_string_lossy().as_bytes());
+        self.metadata_root()
+            .join("cache")
+            .join("unpacked-discs")
+            .join(hex::encode(&digest[..12]))
+    }
+
     pub fn systems_config(&self) -> PathBuf {
         self.retrobat_root()
             .join("emulationstation")

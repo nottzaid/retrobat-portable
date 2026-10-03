@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -40,13 +41,145 @@ impl HostPlatform {
     }
 }
 
+/// A setting a backend needs in its own state before it can start a game
+/// unattended. Each one leaves everything else in that state untouched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeSetting {
+    /// Create the file with these contents only if it does not exist yet.
+    SeedFile { path: PathBuf, contents: String },
+    /// Ensure `key=value` inside `[section]` of an INI file.
+    IniValue {
+        path: PathBuf,
+        section: String,
+        key: String,
+        value: String,
+    },
+    /// Copy `from` to `to` only if `to` does not exist yet.
+    SeedCopy { from: PathBuf, to: PathBuf },
+    /// Ensure the top-level `key: value` of a YAML file.
+    YamlValue {
+        path: PathBuf,
+        key: String,
+        value: String,
+    },
+}
+
+/// What the Wine prefix must provide before a Linux launch through Wine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WineRequirement {
+    /// A plain Windows program: an initialized prefix is enough.
+    Prefix,
+    /// A .NET program (RetroBat, EmulatorLauncher): Wine Mono is required.
+    PrefixWithMono,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchPlan {
-    pub program: PathBuf,
-    pub args: Vec<PathBuf>,
+    pub program: OsString,
+    pub args: Vec<OsString>,
     pub current_dir: PathBuf,
-    pub env: BTreeMap<String, PathBuf>,
+    pub env: BTreeMap<String, OsString>,
+    /// Files rewritten on every launch (RetroArch's appended configuration).
     pub generated_files: Vec<(PathBuf, String)>,
+    /// Directories the backend is configured to use, created before launch.
+    pub generated_directories: Vec<PathBuf>,
+    pub settings: Vec<RuntimeSetting>,
+    /// The Wine prefix this launch runs in, and what it needs from it.
+    pub wine: Option<(PathBuf, WineRequirement)>,
+    /// Backend diagnostic log written by this launch, when the backend
+    /// accepts an explicit log destination. It is replaced on every launch.
+    pub log_file: Option<PathBuf>,
+    /// Where RetroBat's EmulatorLauncher explains a launch it refused.
+    pub refusal: Option<LauncherRefusal>,
+    /// A disc image unpacked (once) before the emulator starts.
+    pub unpacked_disc: Option<UnpackedDisc>,
+    /// A PS Vita package installed into Vita3K before it starts, by its
+    /// title ID: (installation root, package).
+    pub vita_package: Option<(PathBuf, PathBuf)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnpackedDisc {
+    pub kind: DiscFormat,
+    pub image: PathBuf,
+    pub destination: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscFormat {
+    /// An original-Xbox XDVDFS image, for Cxbx-Reloaded.
+    Xbox,
+    /// A gzip-compressed PS2 image, for Play!.
+    Gzip,
+}
+
+impl UnpackedDisc {
+    fn launch_file(&self) -> PathBuf {
+        self.destination.join(match self.kind {
+            DiscFormat::Xbox => "default.xbe",
+            DiscFormat::Gzip => "disc.iso",
+        })
+    }
+}
+
+/// EmulatorLauncher does not signal a refused launch (a missing emulator,
+/// BIOS, or driver) through its exit status: it exits normally and leaves
+/// the reason in `%TEMP%\emulationstation.tmp\launch_error.log` for
+/// EmulationStation to show. RetroPort reads the same file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LauncherRefusal {
+    temp: RefusalTemp,
+    /// EmulatorLauncher's own running log.
+    pub log: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RefusalTemp {
+    /// The Windows user's %TEMP%.
+    Directory(PathBuf),
+    /// %TEMP% of whichever user owns this Wine prefix.
+    WinePrefix(PathBuf),
+}
+
+impl LauncherRefusal {
+    fn files(&self) -> Vec<PathBuf> {
+        let report = Path::new("emulationstation.tmp").join("launch_error.log");
+        match &self.temp {
+            RefusalTemp::Directory(temp) => vec![temp.join(report)],
+            RefusalTemp::WinePrefix(prefix) => fs::read_dir(prefix.join("drive_c").join("users"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|user| user.path().join("AppData/Local/Temp").join(&report))
+                .collect(),
+        }
+    }
+
+    /// Forgets reasons left by earlier launches.
+    pub fn clear(&self) {
+        for file in self.files() {
+            let _ = fs::remove_file(file);
+        }
+    }
+
+    /// The reason EmulatorLauncher gave, if it refused this launch.
+    pub fn reason(&self) -> Option<String> {
+        self.files().iter().find_map(|file| {
+            let bytes = fs::read(file).ok()?;
+            let text = match bytes.as_slice() {
+                [0xff, 0xfe, rest @ ..] => String::from_utf16_lossy(
+                    &rest
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .collect::<Vec<_>>(),
+                ),
+                [0xef, 0xbb, 0xbf, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+                bytes => String::from_utf8_lossy(bytes).into_owned(),
+            };
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -59,39 +192,84 @@ pub enum LaunchError {
     InvalidSystem(String),
     #[error("Wine cannot address a relative game path: {0}")]
     RelativeWinePath(PathBuf),
+    #[error("RetroArch cannot quote a path containing a double quote: {0}")]
+    UnquotablePath(PathBuf),
     #[error("Wine cannot address a non-Unicode game path: {0}")]
     NonUnicodeWinePath(PathBuf),
-    #[error("failed to launch RetroBat: {0}")]
+    #[error(
+        "Wine is not installed or not on PATH; install 64-bit Wine to play this system on Linux"
+    )]
+    WineMissing,
+    #[error("Wine could not prepare its prefix at {prefix}: {message}")]
+    WinePrefix { prefix: PathBuf, message: String },
+    #[error(
+        "this system starts through RetroBat's .NET launcher, which needs Wine Mono. \
+         Install your distribution's wine-mono package (or run `WINEPREFIX=\"{0}\" wineboot -u` \
+         and accept Wine's Mono installer), then press PLAY again"
+    )]
+    WineMonoMissing(PathBuf),
+    #[error(transparent)]
+    XboxDisc(#[from] crate::xiso::XisoError),
+    #[error(transparent)]
+    Vita(#[from] crate::vita::VitaError),
+    #[error("failed to start the backend: {0}")]
     Io(#[from] io::Error),
 }
 
 impl LaunchPlan {
+    fn new(program: impl Into<OsString>, current_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            current_dir: current_dir.into(),
+            env: BTreeMap::new(),
+            generated_files: Vec::new(),
+            generated_directories: Vec::new(),
+            settings: Vec::new(),
+            wine: None,
+            log_file: None,
+            refusal: None,
+            unpacked_disc: None,
+            vita_package: None,
+        }
+    }
+
+    fn arg(mut self, argument: impl Into<OsString>) -> Self {
+        self.args.push(argument.into());
+        self
+    }
+
+    /// A Windows program started through Wine in RetroPort's prefix.
+    fn under_wine(
+        linux_data_dir: Option<&Path>,
+        program: &Path,
+        current_dir: impl Into<PathBuf>,
+        requirement: WineRequirement,
+    ) -> Result<Self, LaunchError> {
+        let prefix = wine_prefix(linux_data_dir)?;
+        let mut plan = Self::new("wine", current_dir).arg(program);
+        plan.env
+            .insert("WINEPREFIX".to_owned(), prefix.clone().into_os_string());
+        plan.wine = Some((prefix, requirement));
+        Ok(plan)
+    }
+
     pub fn for_host(
         layout: &PortableLayout,
         host: HostPlatform,
         linux_data_dir: Option<&Path>,
     ) -> Result<Self, LaunchError> {
         match host {
-            HostPlatform::Windows => Ok(Self {
-                program: layout.retrobat_executable(),
-                args: Vec::new(),
-                current_dir: layout.retrobat_root(),
-                env: BTreeMap::new(),
-                generated_files: Vec::new(),
-            }),
-            HostPlatform::Linux => {
-                let data_dir = linux_data_dir.ok_or(LaunchError::NoDataDirectory)?;
-                Ok(Self {
-                    program: PathBuf::from("wine"),
-                    args: vec![layout.retrobat_executable()],
-                    current_dir: layout.retrobat_root(),
-                    env: BTreeMap::from([(
-                        "WINEPREFIX".to_owned(),
-                        data_dir.join("retrobat-portable").join("wine-prefix"),
-                    )]),
-                    generated_files: Vec::new(),
-                })
-            }
+            HostPlatform::Windows => Ok(Self::new(
+                layout.retrobat_executable(),
+                layout.retrobat_root(),
+            )),
+            HostPlatform::Linux => Self::under_wine(
+                linux_data_dir,
+                &layout.retrobat_executable(),
+                layout.retrobat_root(),
+                WineRequirement::PrefixWithMono,
+            ),
             HostPlatform::Unsupported => Err(LaunchError::Unsupported),
         }
     }
@@ -150,17 +328,19 @@ impl LaunchPlan {
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
         {
-            let data_dir = linux_data_dir.ok_or(LaunchError::NoDataDirectory)?;
-            return Ok(Self {
-                program: PathBuf::from("wine"),
-                args: vec![rom.to_owned()],
-                current_dir: rom.parent().unwrap_or_else(|| Path::new(".")).to_owned(),
-                env: BTreeMap::from([(
-                    "WINEPREFIX".to_owned(),
-                    data_dir.join("retrobat-portable").join("wine-prefix"),
-                )]),
-                generated_files: Vec::new(),
-            });
+            return Self::under_wine(
+                linux_data_dir,
+                rom,
+                rom.parent().unwrap_or_else(|| Path::new(".")),
+                WineRequirement::Prefix,
+            );
+        }
+        if backend.is_some_and(|route| route.emulator.eq_ignore_ascii_case("vita3k")) {
+            // This Vita3K ignores a package on its command line, so RetroPort
+            // installs it and starts it by title ID on both hosts.
+            let mut plan = vita3k_plan(layout, host, vec!["-F".into()])?;
+            plan.vita_package = Some((layout.root.clone(), rom.to_owned()));
+            return Ok(plan);
         }
         if host == HostPlatform::Linux
             && let Some(backend) = backend
@@ -169,42 +349,60 @@ impl LaunchPlan {
             return Ok(plan);
         }
 
-        let launcher = layout.emulator_launcher_executable();
-        let mut args = vec![PathBuf::from("-system"), PathBuf::from(system)];
-        if let Some(backend) = backend {
-            args.extend([PathBuf::from("-emulator"), PathBuf::from(&backend.emulator)]);
-            if let Some(core) = &backend.core {
-                args.extend([PathBuf::from("-core"), PathBuf::from(core)]);
-            }
+        // RetroBat hands Cxbx-Reloaded a disc image only by mounting it
+        // through the Dokan driver, and Play! reads no gzip images; RetroPort
+        // unpacks those itself.
+        let emulator = backend.map(|route| route.emulator.to_ascii_lowercase());
+        let extension = rom
+            .extension()
+            .map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+        let unpacked_disc = match (emulator.as_deref(), extension.as_deref()) {
+            (Some("cxbx"), Some("iso")) => Some(DiscFormat::Xbox),
+            (Some("play"), Some("gz")) => Some(DiscFormat::Gzip),
+            _ => None,
         }
-        args.push(PathBuf::from("-rom"));
-        let (program, current_dir, env) = match host {
-            HostPlatform::Windows => {
-                args.push(rom.to_owned());
-                (launcher, layout.emulationstation_root(), BTreeMap::new())
-            }
-            HostPlatform::Linux => {
-                let data_dir = linux_data_dir.ok_or(LaunchError::NoDataDirectory)?;
-                args.insert(0, launcher);
-                args.push(wine_path(rom)?);
-                (
-                    PathBuf::from("wine"),
-                    layout.emulationstation_root(),
-                    BTreeMap::from([(
-                        "WINEPREFIX".to_owned(),
-                        data_dir.join("retrobat-portable").join("wine-prefix"),
-                    )]),
-                )
-            }
+        .map(|kind| UnpackedDisc {
+            kind,
+            image: rom.to_owned(),
+            destination: layout.unpacked_disc(rom),
+        });
+        let launch_file = unpacked_disc
+            .as_ref()
+            .map_or_else(|| rom.to_owned(), UnpackedDisc::launch_file);
+        let launcher = layout.emulator_launcher_executable();
+        let rom_argument = match host {
+            HostPlatform::Windows => launch_file,
+            HostPlatform::Linux => wine_path(&launch_file)?,
             HostPlatform::Unsupported => return Err(LaunchError::Unsupported),
         };
-        Ok(Self {
-            program,
-            args,
-            current_dir,
-            env,
-            generated_files: Vec::new(),
-        })
+        let mut plan = match host {
+            HostPlatform::Windows => Self::new(launcher, layout.emulationstation_root()),
+            _ => Self::under_wine(
+                linux_data_dir,
+                &launcher,
+                layout.emulationstation_root(),
+                WineRequirement::PrefixWithMono,
+            )?,
+        };
+        plan.unpacked_disc = unpacked_disc;
+        if emulator.as_deref() == Some("xemu") {
+            plan.settings.push(xemu_hard_disk(layout));
+        }
+        plan.refusal = Some(LauncherRefusal {
+            temp: match &plan.wine {
+                Some((prefix, _)) => RefusalTemp::WinePrefix(prefix.clone()),
+                None => RefusalTemp::Directory(std::env::temp_dir()),
+            },
+            log: layout.emulationstation_root().join("emulatorLauncher.log"),
+        });
+        plan = plan.arg("-system").arg(system);
+        if let Some(backend) = backend {
+            plan = plan.arg("-emulator").arg(&backend.emulator);
+            if let Some(core) = &backend.core {
+                plan = plan.arg("-core").arg(core);
+            }
+        }
+        Ok(plan.arg("-rom").arg(rom_argument))
     }
 
     fn for_retroarch_core(
@@ -212,114 +410,127 @@ impl LaunchPlan {
         host: HostPlatform,
         linux_data_dir: Option<&Path>,
         system: &str,
-        core: &str,
+        core_name: &str,
         rom: &Path,
     ) -> Result<Self, LaunchError> {
         let retroarch = layout.retroarch_executable();
-        let core = layout.retroarch_core(core);
-        let save = layout.retrobat_root().join("saves").join(system);
-        let state = layout
-            .retrobat_root()
-            .join("saves")
-            .join(system)
-            .join("states");
-        let append_config = layout
-            .metadata_root()
-            .join("runtime")
-            .join("retroarch")
-            .join(format!("{system}.cfg"));
-        let mut args = Vec::new();
-        let (program, env, config_argument, save_value, state_value) = match host {
-            HostPlatform::Windows => {
-                let save_value = retroarch_config_path(&save);
-                let state_value = retroarch_config_path(&state);
-                args.extend([
-                    PathBuf::from("--appendconfig"),
-                    append_config.clone(),
-                    PathBuf::from("-L"),
-                    core,
-                    rom.to_owned(),
-                ]);
-                (
-                    retroarch,
-                    BTreeMap::new(),
-                    append_config.clone(),
-                    save_value,
-                    state_value,
-                )
+        let core = layout.retroarch_core(core_name);
+        let retrobat = layout.retrobat_root();
+        let save = retrobat.join("saves").join(system);
+        let state = save.join("states");
+        let runtime = layout.metadata_root().join("runtime").join("retroarch");
+        let append_config = runtime.join(format!("{system}.cfg"));
+        let log_file = retroarch_log_path(layout, system);
+        // RetroArch's shared retroarch.cfg is rewritten by EmulatorLauncher
+        // and by RetroArch itself, so it can hold absolute paths from another
+        // machine, drive letter, or installation. Every location-dependent
+        // setting a direct launch relies on is therefore pinned here, to this
+        // installation. RetroArch ignores a missing directory, so each one is
+        // also created before launch.
+        let directories = [
+            ("system_directory", retrobat.join("bios")),
+            ("savefile_directory", save.clone()),
+            ("savestate_directory", state.clone()),
+            ("screenshot_directory", retrobat.join("screenshots")),
+            (
+                "cheat_database_path",
+                retrobat.join("cheats").join("retroarch"),
+            ),
+            (
+                "recording_output_directory",
+                retrobat.join("records").join("output"),
+            ),
+            (
+                "recording_config_directory",
+                retrobat.join("records").join("config"),
+            ),
+            ("rgui_browser_directory", retrobat.join("roms")),
+            (
+                "cache_directory",
+                layout.metadata_root().join("cache").join("retroarch"),
+            ),
+        ];
+        let host_path = |path: &Path| -> Result<PathBuf, LaunchError> {
+            match host {
+                HostPlatform::Windows => Ok(path.to_owned()),
+                HostPlatform::Linux => wine_path(path),
+                HostPlatform::Unsupported => Err(LaunchError::Unsupported),
             }
-            HostPlatform::Linux => {
-                let data_dir = linux_data_dir.ok_or(LaunchError::NoDataDirectory)?;
-                let config_argument = wine_path(&append_config)?;
-                let save_value = retroarch_config_path(&wine_path(&save)?);
-                let state_value = retroarch_config_path(&wine_path(&state)?);
-                args.extend([
-                    retroarch,
-                    PathBuf::from("--appendconfig"),
-                    config_argument.clone(),
-                    PathBuf::from("-L"),
-                    wine_path(&core)?,
-                    wine_path(rom)?,
-                ]);
-                (
-                    PathBuf::from("wine"),
-                    BTreeMap::from([(
-                        "WINEPREFIX".to_owned(),
-                        data_dir.join("retrobat-portable").join("wine-prefix"),
-                    )]),
-                    config_argument,
-                    save_value,
-                    state_value,
-                )
+        };
+        let config_value = |path: &Path| -> Result<String, LaunchError> {
+            let value = retroarch_config_path(&host_path(path)?);
+            if value.contains('"') {
+                return Err(LaunchError::UnquotablePath(path.to_owned()));
             }
+            Ok(value)
+        };
+        let mut config = String::new();
+        for (key, directory) in &directories {
+            config.push_str(&format!("{key} = \"{}\"\n", config_value(directory)?));
+        }
+        let mut generated_files = Vec::new();
+        config.push_str(concat!(
+            // The overlay in the shared configuration belongs to whichever
+            // system EmulatorLauncher prepared last and names a file on that
+            // machine; a direct launch never inherits it.
+            "input_overlay_enable = \"false\"\n",
+            "input_overlay = \"\"\n",
+            // Likewise the shared display geometry is that machine's: a custom
+            // viewport sized for its bezel (aspect_ratio_index 23) and a fixed
+            // fullscreen mode crop the game on any other display. Use the
+            // core's aspect ratio, centred, at this desktop's resolution.
+            "aspect_ratio_index = \"22\"\n",
+            "video_aspect_ratio_auto = \"true\"\n",
+            "video_viewport_bias_x = \"0.500000\"\n",
+            "video_viewport_bias_y = \"0.500000\"\n",
+            "video_fullscreen = \"true\"\n",
+            "video_windowed_fullscreen = \"true\"\n",
+            "video_fullscreen_x = \"0\"\n",
+            "video_fullscreen_y = \"0\"\n",
+            // Rewind snapshots every frame; inherited from another system's
+            // session it costs performance and makes cores such as DOSBox Pure
+            // report save-state errors over the game.
+            "rewind_enable = \"false\"\n",
+            "config_save_on_exit = \"false\"\n",
+            "audio_enable = \"true\"\n",
+            "audio_driver = \"xaudio\"\n",
+            "audio_mute_enable = \"false\"\n",
+            "audio_mixer_mute_enable = \"false\"\n",
+            "audio_volume = \"0.000000\"\n",
+            "input_autodetect_enable = \"true\"\n",
+            "input_joypad_driver = \"sdl2\"\n",
+        ));
+        for (key, value) in retroarch_input_overrides(system) {
+            config.push_str(&format!("{key} = \"{value}\"\n"));
+        }
+        generated_files.insert(0, (append_config.clone(), config));
+
+        let mut plan = match host {
+            HostPlatform::Windows => Self::new(retroarch, layout.retroarch_root()),
+            HostPlatform::Linux => Self::under_wine(
+                linux_data_dir,
+                &retroarch,
+                layout.retroarch_root(),
+                WineRequirement::Prefix,
+            )?,
             HostPlatform::Unsupported => return Err(LaunchError::Unsupported),
         };
-        debug_assert!(args.iter().any(|argument| argument == &config_argument));
-        let mut config = format!(
-            concat!(
-                "savefile_directory = \"{}\"\n",
-                "savestate_directory = \"{}\"\n",
-                "config_save_on_exit = \"false\"\n",
-                "audio_enable = \"true\"\n",
-                "audio_driver = \"xaudio\"\n",
-                "audio_mute_enable = \"false\"\n",
-                "audio_mixer_mute_enable = \"false\"\n",
-                "audio_volume = \"0.000000\"\n",
-                "input_autodetect_enable = \"true\"\n",
-                "input_joypad_driver = \"sdl2\"\n",
-                "input_player1_joypad_index = \"0\"\n",
-                "input_player1_analog_dpad_mode = \"1\"\n",
-                "input_player1_b_btn = \"0\"\n",
-                "input_player1_a_btn = \"1\"\n",
-                "input_player1_y_btn = \"2\"\n",
-                "input_player1_x_btn = \"3\"\n",
-                "input_player1_select_btn = \"4\"\n",
-                "input_player1_start_btn = \"6\"\n",
-                "input_player1_up_btn = \"11\"\n",
-                "input_player1_down_btn = \"12\"\n",
-                "input_player1_left_btn = \"13\"\n",
-                "input_player1_right_btn = \"14\"\n"
-            ),
-            save_value.replace('"', "\\\""),
-            state_value.replace('"', "\\\"")
-        );
-        if system == "mame" {
-            config.push_str(concat!(
-                "input_player1_select = \"num5\"\n",
-                "input_player1_start = \"num1\"\n",
-                "input_player1_up = \"up\"\n",
-                "input_player1_down = \"down\"\n",
-                "input_player1_left = \"left\"\n",
-                "input_player1_right = \"right\"\n"
-            ));
-        }
-        Ok(Self {
-            program,
-            args,
-            current_dir: layout.retroarch_root(),
-            env,
-            generated_files: vec![(append_config, config)],
-        })
+        plan = plan
+            .arg("--verbose")
+            .arg("--log-file")
+            .arg(host_path(&log_file)?)
+            .arg("--appendconfig")
+            .arg(host_path(&append_config)?)
+            .arg("-L")
+            .arg(host_path(&core)?)
+            .arg(host_path(rom)?);
+        plan.generated_files = generated_files;
+        plan.generated_directories = directories
+            .into_iter()
+            .map(|(_, directory)| directory)
+            .collect();
+        plan.log_file = Some(log_file);
+        Ok(plan)
     }
 
     pub fn for_current_game(
@@ -361,43 +572,43 @@ impl LaunchPlan {
         firmware: &Path,
     ) -> Result<Self, LaunchError> {
         let rpcs3 = layout.rpcs3_executable();
-        let current_dir = layout.emulator_root("rpcs3");
         let native = layout.linux_runtime_root().join("RPCS3.AppImage");
-        let (program, args, env) = match host {
-            HostPlatform::Windows => (
-                rpcs3,
-                vec![PathBuf::from("--installfw"), firmware.to_owned()],
-                BTreeMap::new(),
-            ),
-            HostPlatform::Linux => {
-                if native.is_file() {
-                    return Ok(Self {
-                        program: native,
-                        args: vec![PathBuf::from("--installfw"), firmware.to_owned()],
-                        current_dir: layout.linux_runtime_root(),
-                        env: native_linux_environment(layout, "rpcs3"),
-                        generated_files: Vec::new(),
-                    });
-                }
-                let data_dir = linux_data_dir.ok_or(LaunchError::NoDataDirectory)?;
-                (
-                    PathBuf::from("wine"),
-                    vec![rpcs3, PathBuf::from("--installfw"), wine_path(firmware)?],
-                    BTreeMap::from([(
-                        "WINEPREFIX".to_owned(),
-                        data_dir.join("retrobat-portable").join("wine-prefix"),
-                    )]),
-                )
-            }
-            HostPlatform::Unsupported => return Err(LaunchError::Unsupported),
-        };
-        Ok(Self {
-            program,
-            args,
-            current_dir,
-            env,
-            generated_files: Vec::new(),
-        })
+        match host {
+            HostPlatform::Windows => Ok(Self::new(rpcs3, layout.emulator_root("rpcs3"))
+                .arg("--installfw")
+                .arg(firmware)),
+            HostPlatform::Linux if native.is_file() => Ok(native_linux_plan(
+                layout,
+                native,
+                vec!["--installfw".into(), firmware.into()],
+                "rpcs3",
+            )),
+            HostPlatform::Linux => Ok(Self::under_wine(
+                linux_data_dir,
+                &rpcs3,
+                layout.emulator_root("rpcs3"),
+                WineRequirement::Prefix,
+            )?
+            .arg("--installfw")
+            .arg(wine_path(firmware)?)),
+            HostPlatform::Unsupported => Err(LaunchError::Unsupported),
+        }
+    }
+
+    /// Installs Sony's PS Vita system software or font package into Vita3K.
+    pub fn for_vita3k_firmware_install(
+        layout: &PortableLayout,
+        host: HostPlatform,
+        firmware: &Path,
+    ) -> Result<Self, LaunchError> {
+        vita3k_plan(layout, host, vec!["--firmware".into(), firmware.into()])
+    }
+
+    pub fn for_current_vita3k_firmware_install(
+        layout: &PortableLayout,
+        firmware: &Path,
+    ) -> Result<Self, LaunchError> {
+        Self::for_vita3k_firmware_install(layout, HostPlatform::current(), firmware)
     }
 
     pub fn for_current_rpcs3_firmware_install(
@@ -413,11 +624,33 @@ impl LaunchPlan {
         )
     }
 
-    pub fn spawn(&self) -> Result<Child, LaunchError> {
-        self.prepare_runtime()?;
+    /// Opens RetroArch's local command port for this launch only, so a
+    /// diagnostic run can ask the running game for a screenshot. Returns
+    /// false when the plan does not start RetroArch directly.
+    pub fn enable_retroarch_commands(&mut self, port: u16) -> bool {
+        if self.log_file.is_none() {
+            return false;
+        }
+        let Some((_, config)) = self.generated_files.first_mut() else {
+            return false;
+        };
+        config.push_str(&format!(
+            "network_cmd_enable = \"true\"\nnetwork_cmd_port = \"{port}\"\n"
+        ));
+        true
+    }
+
+    /// Prepares everything the backend needs and starts it in its own
+    /// process group. Preparing a new Wine prefix can take a minute, so call
+    /// this from a worker thread; `progress` receives user-facing phases.
+    pub fn spawn(&self, progress: &dyn Fn(&str)) -> Result<Child, LaunchError> {
+        let prepared = self.prepare_runtime(progress)?;
 
         let mut command = Command::new(&self.program);
-        command.args(&self.args).current_dir(&self.current_dir);
+        command
+            .args(&self.args)
+            .args(prepared)
+            .current_dir(&self.current_dir);
         #[cfg(unix)]
         command.process_group(0);
         for (key, value) in &self.env {
@@ -426,14 +659,16 @@ impl LaunchPlan {
         Ok(command.spawn()?)
     }
 
-    fn prepare_runtime(&self) -> Result<(), LaunchError> {
-        if let Some(prefix) = self.env.get("WINEPREFIX") {
-            fs::create_dir_all(prefix)?;
-        }
+    /// Prepares everything the backend needs; returns arguments that only
+    /// preparation can determine (an installed Vita app's title ID).
+    pub fn prepare_runtime(&self, progress: &dyn Fn(&str)) -> Result<Vec<OsString>, LaunchError> {
         for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] {
             if let Some(directory) = self.env.get(key) {
                 fs::create_dir_all(directory)?;
             }
+        }
+        for directory in &self.generated_directories {
+            fs::create_dir_all(directory)?;
         }
         for (path, contents) in &self.generated_files {
             if let Some(parent) = path.parent() {
@@ -441,8 +676,358 @@ impl LaunchPlan {
             }
             fs::write(path, contents)?;
         }
-        Ok(())
+        for setting in &self.settings {
+            apply_runtime_setting(setting)?;
+        }
+        if let Some(log) = &self.log_file {
+            if let Some(parent) = log.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            // A previous launch's log must never be mistaken for evidence
+            // about this one.
+            match fs::remove_file(log) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if let Some(disc) = &self.unpacked_disc {
+            match disc.kind {
+                DiscFormat::Xbox => {
+                    progress("Unpacking the Xbox disc for Cxbx-Reloaded (first PLAY only)…");
+                    crate::xiso::unpack_cached(&disc.image, &disc.destination)?;
+                }
+                DiscFormat::Gzip => {
+                    progress("Decompressing the disc image for Play! (first PLAY only)…");
+                    crate::xiso::gunzip_cached(&disc.image, &disc.destination)?;
+                }
+            }
+        }
+        if let Some((prefix, requirement)) = &self.wine {
+            prepare_wine_prefix(prefix, *requirement, progress)?;
+        }
+        let mut arguments = Vec::new();
+        if let Some((root, package)) = &self.vita_package {
+            progress("Installing the PS Vita package into Vita3K (first PLAY only)…");
+            let title = crate::vita::install_package(&PortableLayout::new(root), package)?;
+            arguments.extend(["-r".into(), title.into()]);
+        }
+        Ok(arguments)
     }
+}
+
+/// Player-one input RetroPort pins on every direct RetroArch launch of
+/// `system` (a RetroBat system name). CONTROLS reads the same list, so what
+/// it shows is what PLAY applies.
+pub fn retroarch_input_overrides(system: &str) -> Vec<(&'static str, &'static str)> {
+    // SDL2 GameController indices: A/B/X/Y are 0/1/2/3 by position, Back 4,
+    // Start 6, D-pad 11-14. RetroPad B is the bottom face button.
+    let mut overrides = vec![
+        ("input_player1_joypad_index", "0"),
+        ("input_player1_analog_dpad_mode", "1"),
+        ("input_player1_b_btn", "0"),
+        ("input_player1_a_btn", "1"),
+        ("input_player1_y_btn", "2"),
+        ("input_player1_x_btn", "3"),
+        ("input_player1_select_btn", "4"),
+        ("input_player1_start_btn", "6"),
+        ("input_player1_up_btn", "11"),
+        ("input_player1_down_btn", "12"),
+        ("input_player1_left_btn", "13"),
+        ("input_player1_right_btn", "14"),
+    ];
+    if system == "mame" {
+        // MAME's own coin and start keys, and arrow keys for the joystick.
+        overrides.extend([
+            ("input_player1_select", "num5"),
+            ("input_player1_start", "num1"),
+            ("input_player1_up", "up"),
+            ("input_player1_down", "down"),
+            ("input_player1_left", "left"),
+            ("input_player1_right", "right"),
+        ]);
+    }
+    overrides
+}
+
+/// Whether PLAY starts this system's games through RetroArch directly on
+/// this host (Linux libretro routes, and CHIP-8 everywhere).
+pub fn uses_direct_retroarch(host: HostPlatform, system: &str, emulator: Option<&str>) -> bool {
+    system == "chip8"
+        || (host == HostPlatform::Linux
+            && emulator.is_some_and(|emulator| emulator.eq_ignore_ascii_case("libretro")))
+}
+
+/// Where a direct RetroArch launch for `system` writes its verbose log.
+pub fn retroarch_log_path(layout: &PortableLayout, system: &str) -> PathBuf {
+    layout
+        .metadata_root()
+        .join("logs")
+        .join(format!("retroarch-{system}.log"))
+}
+
+/// Linux keeps only Wine's symlink-heavy prefix outside the installation.
+pub fn wine_prefix(linux_data_dir: Option<&Path>) -> Result<PathBuf, LaunchError> {
+    Ok(linux_data_dir
+        .ok_or(LaunchError::NoDataDirectory)?
+        .join("retrobat-portable")
+        .join("wine-prefix"))
+}
+
+fn apply_runtime_setting(setting: &RuntimeSetting) -> io::Result<()> {
+    match setting {
+        RuntimeSetting::SeedFile { path, contents } => {
+            if path.exists() {
+                return Ok(());
+            }
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, contents)
+        }
+        RuntimeSetting::IniValue {
+            path,
+            section,
+            key,
+            value,
+        } => {
+            let existing = match fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(error),
+            };
+            let updated = set_ini_value(&existing, section, key, value);
+            if updated != existing {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, updated)?;
+            }
+            Ok(())
+        }
+        RuntimeSetting::SeedCopy { from, to } => {
+            if to.exists() {
+                return Ok(());
+            }
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(from, to).map(|_| ())
+        }
+        RuntimeSetting::YamlValue { path, key, value } => {
+            let existing = match fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(error),
+            };
+            let updated = set_yaml_value(&existing, key, value);
+            if updated != existing {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, updated)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Sets a top-level `key: value` line, leaving every other line as it is.
+fn set_yaml_value(contents: &str, key: &str, value: &str) -> String {
+    let line = format!("{key}: {value}");
+    let mut found = false;
+    let mut lines = contents
+        .lines()
+        .map(|existing| {
+            let is_key = existing
+                .strip_prefix(key)
+                .is_some_and(|rest| rest.trim_start().starts_with(':'));
+            if is_key && !found {
+                found = true;
+                line.clone()
+            } else {
+                existing.to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    if !found {
+        lines.push(line);
+    }
+    let mut updated = lines.join("\n");
+    updated.push('\n');
+    updated
+}
+
+fn set_ini_value(contents: &str, section: &str, key: &str, value: &str) -> String {
+    let header = format!("[{section}]");
+    let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+    let start = lines.iter().position(|line| line.trim() == header);
+    let Some(start) = start else {
+        if !lines.is_empty() && !lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push(header);
+        lines.push(format!("{key}={value}"));
+        return lines.join("\n") + "\n";
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| line.trim_start().starts_with('['))
+        .map_or(lines.len(), |offset| start + 1 + offset);
+    match lines[start + 1..end].iter().position(|line| {
+        line.split_once('=')
+            .is_some_and(|(name, _)| name.trim() == key)
+    }) {
+        Some(offset) => lines[start + 1 + offset] = format!("{key}={value}"),
+        None => {
+            let mut insert = end;
+            while insert > start + 1 && lines[insert - 1].trim().is_empty() {
+                insert -= 1;
+            }
+            lines.insert(insert, format!("{key}={value}"));
+        }
+    }
+    lines.join("\n") + "\n"
+}
+
+/// Creates the prefix on first use and makes sure it can run what the plan
+/// starts, instead of letting a game launch race Wine's own initialisation.
+fn prepare_wine_prefix(
+    prefix: &Path,
+    requirement: WineRequirement,
+    progress: &dyn Fn(&str),
+) -> Result<(), LaunchError> {
+    let wine_failure = |error: io::Error| match error.kind() {
+        io::ErrorKind::NotFound => LaunchError::WineMissing,
+        _ => LaunchError::WinePrefix {
+            prefix: prefix.to_owned(),
+            message: error.to_string(),
+        },
+    };
+    // Wine writes system.reg early, so its presence does not prove that
+    // initialisation finished; an interrupted wineboot leaves a prefix
+    // without 32-bit support. RetroPort marks a prefix only once wineboot
+    // has completed, and repairs any prefix without that mark.
+    let ready = prefix.join(".retroport-prefix-ready");
+    if !ready.is_file() && prefix_looks_complete(prefix) {
+        // A prefix from an earlier RetroPort version that finished setup.
+        fs::write(&ready, b"existing prefix verified\n")?;
+    }
+    if !ready.is_file() {
+        if prefix.exists() {
+            // Interrupted setup. The prefix holds nothing of the user's own
+            // (games, saves and configuration live in the installation), so
+            // it is moved aside, never deleted, and created afresh.
+            let aside = prefix.with_file_name(format!(
+                "wine-prefix.incomplete-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            ));
+            fs::rename(prefix, aside)?;
+        }
+        progress(
+            "Preparing Wine for its first launch; this can take a minute. \
+             If Wine offers to install Mono or Gecko, choose Install.",
+        );
+        fs::create_dir_all(prefix)?;
+        let status = background_command("wineboot")
+            .arg("--init")
+            .env("WINEPREFIX", prefix)
+            .stdin(Stdio::null())
+            .status()
+            .map_err(wine_failure)?;
+        let _ = background_command("wineserver")
+            .arg("--wait")
+            .env("WINEPREFIX", prefix)
+            .status();
+        if !status.success() || !prefix.join("system.reg").is_file() {
+            return Err(LaunchError::WinePrefix {
+                prefix: prefix.to_owned(),
+                message: format!("wineboot exited with {status}"),
+            });
+        }
+        fs::write(&ready, b"wineboot completed\n")?;
+    }
+    if requirement == WineRequirement::PrefixWithMono && !wine_mono_available(prefix) {
+        if let Some(installer) = cached_wine_mono_installer() {
+            progress("Installing Wine Mono for RetroBat's launcher…");
+            let _ = background_command("wine")
+                .args([OsStr::new("msiexec"), OsStr::new("/i")])
+                .arg(&installer)
+                .arg("/qn")
+                .env("WINEPREFIX", prefix)
+                .stdin(Stdio::null())
+                .status()
+                .map_err(wine_failure)?;
+            let _ = background_command("wineserver")
+                .arg("--wait")
+                .env("WINEPREFIX", prefix)
+                .status();
+        }
+        if !wine_mono_available(prefix) {
+            return Err(LaunchError::WineMonoMissing(prefix.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+/// Whether wineboot finished creating this prefix: its registry exists and a
+/// 64-bit prefix has the 32-bit system directory that setup creates last.
+fn prefix_looks_complete(prefix: &Path) -> bool {
+    let windows = prefix.join("drive_c").join("windows");
+    let win64 = fs::read_to_string(prefix.join("system.reg"))
+        .map(|registry| registry.contains("#arch=win64"));
+    match win64 {
+        Ok(true) => {
+            fs::read_dir(windows.join("syswow64")).is_ok_and(|mut entries| entries.next().is_some())
+        }
+        Ok(false) => windows.join("system32").is_dir(),
+        Err(_) => false,
+    }
+}
+
+/// Wine loads Mono from the prefix or from a system-wide installation.
+fn wine_mono_available(prefix: &Path) -> bool {
+    prefix.join("drive_c").join("windows").join("mono").is_dir()
+        || [
+            "/usr/share/wine/mono",
+            "/usr/lib/wine/mono",
+            "/opt/wine/mono",
+        ]
+        .iter()
+        .any(|directory| fs::read_dir(directory).is_ok_and(|mut entries| entries.next().is_some()))
+}
+
+/// Wine's own Mono download is cached here once the user has accepted it.
+fn cached_wine_mono_installer() -> Option<PathBuf> {
+    let cache = dirs::cache_dir()?.join("wine");
+    let mut installers = fs::read_dir(cache)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with("wine-mono-") && name.ends_with(".msi"))
+        })
+        .collect::<Vec<_>>();
+    installers.sort();
+    installers.pop()
+}
+
+/// A helper process that must never open a console window on Windows.
+pub(crate) fn background_command(program: impl AsRef<OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
 
 pub fn terminate_process_tree(child: &mut Child, force: bool) -> Result<(), LaunchError> {
@@ -468,7 +1053,7 @@ pub fn terminate_process_tree_id(process_id: u32, force: bool) -> Result<(), Lau
     }
     #[cfg(target_os = "windows")]
     {
-        let mut command = Command::new("taskkill");
+        let mut command = background_command("taskkill");
         command.args(["/PID", &process_id.to_string(), "/T"]);
         if force {
             command.arg("/F");
@@ -496,11 +1081,79 @@ pub fn process_tree_is_running(process_id: u32) -> bool {
         // receives no pointer arguments.
         (unsafe { libc::kill(-(process_id as i32), 0) } == 0)
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        windows_tree_is_running(process_id)
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
     {
         let _ = process_id;
         false
     }
+}
+
+/// Whether `root` or any process descended from it is still running. A
+/// launcher such as EmulatorLauncher may exit while the emulator it started
+/// runs on, so descendants count; a listed process counts only while
+/// Windows reports it active, since an exited one stays listed while any
+/// handle to it is open.
+#[cfg(target_os = "windows")]
+fn windows_tree_is_running(root: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, STILL_ACTIVE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: a process snapshot takes no pointers; the handle is checked
+    // and closed below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let mut processes = Vec::new();
+    // SAFETY: PROCESSENTRY32W is plain data; dwSize is set as the API
+    // requires before the first call, and the entry outlives every call.
+    unsafe {
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snapshot, &mut entry);
+        while more != 0 {
+            processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
+            more = Process32NextW(snapshot, &mut entry);
+        }
+        CloseHandle(snapshot);
+    }
+    let mut tree = vec![root];
+    let mut index = 0;
+    while index < tree.len() {
+        let parent = tree[index];
+        for &(process, parent_of) in &processes {
+            if parent_of == parent && process != parent && !tree.contains(&process) {
+                tree.push(process);
+            }
+        }
+        index += 1;
+    }
+    tree.into_iter().any(|process| {
+        if !processes.iter().any(|&(listed, _)| listed == process) {
+            return false;
+        }
+        // SAFETY: the handle is checked before use and always closed.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let queried = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            queried != 0 && code == STILL_ACTIVE as u32
+        }
+    })
 }
 
 fn retroarch_config_path(path: &Path) -> String {
@@ -514,54 +1167,244 @@ fn native_linux_game_plan(
 ) -> Option<LaunchPlan> {
     let runtime = layout.linux_runtime_root();
     let emulator = backend.emulator.to_ascii_lowercase();
-    let (program, args, key) = match emulator.as_str() {
+    let (program, args, key): (PathBuf, Vec<OsString>, &str) = match emulator.as_str() {
         "eden" => (
             runtime.join("Eden.AppImage"),
-            vec![PathBuf::from("-f"), PathBuf::from("-g"), rom.to_owned()],
+            vec!["-f".into(), "-g".into(), rom.into()],
             "eden",
         ),
         "cemu" => (
             runtime.join("Cemu.AppImage"),
-            vec![PathBuf::from("-g"), rom.to_owned(), PathBuf::from("-f")],
+            vec!["-g".into(), rom.into(), "-f".into()],
             "cemu",
         ),
         "rpcs3" => (
             runtime.join("RPCS3.AppImage"),
-            vec![PathBuf::from("--no-gui"), rom.to_owned()],
+            vec!["--no-gui".into(), "--fullscreen".into(), rom.into()],
             "rpcs3",
         ),
         "shadps4" => (
             runtime.join("shadPS4/Shadps4-sdl.AppImage"),
-            vec![rom.to_owned()],
+            vec![rom.into()],
             "shadps4",
         ),
         "xenia-canary" => (
             runtime.join("XeniaCanary.AppImage"),
-            vec![rom.to_owned()],
+            vec![rom.into()],
             "xenia-canary",
+        ),
+        // -batch exits with the game; -nogui keeps the library window away.
+        "pcsx2" => (
+            runtime.join("PCSX2.AppImage"),
+            vec![
+                "-batch".into(),
+                "-nogui".into(),
+                "-fullscreen".into(),
+                "--".into(),
+                rom.into(),
+            ],
+            "pcsx2",
+        ),
+        "xemu" => (
+            runtime.join("xemu.AppImage"),
+            vec!["-full-screen".into()],
+            "xemu",
         ),
         _ => return None,
     };
-    program.is_file().then(|| LaunchPlan {
-        program,
-        args,
-        current_dir: runtime,
-        env: native_linux_environment(layout, key),
-        generated_files: Vec::new(),
-    })
+    if !program.is_file() {
+        return None;
+    }
+    let mut plan = native_linux_plan(layout, program, args, key);
+    if key == "xemu" {
+        // xemu reads every path, the disc included, from its configuration.
+        let config = layout
+            .metadata_root()
+            .join("runtime/linux/xemu/data/xemu/xemu/xemu.toml");
+        let bios = layout.retrobat_root().join("bios");
+        let saves = layout.retrobat_root().join("saves").join("xbox");
+        let contents = format!(
+            "[general]\nshow_welcome = false\n\n[general.updates]\ncheck = false\n\n\
+             [display.window]\nfullscreen_on_startup = true\n\n[sys.files]\n\
+             bootrom_path = {}\nflashrom_path = {}\neeprom_path = {}\nhdd_path = {}\ndvd_path = {}\n",
+            toml_string(&bios.join("mcpx_1.0.bin")),
+            toml_string(&bios.join("Complex_4627.bin")),
+            toml_string(&saves.join("eeprom.bin")),
+            toml_string(&saves.join("xbox_hdd.qcow2")),
+            toml_string(rom),
+        );
+        plan.generated_files.push((config, contents));
+        plan.settings.push(xemu_hard_disk(layout));
+    }
+    Some(plan)
 }
 
-fn native_linux_environment(layout: &PortableLayout, emulator: &str) -> BTreeMap<String, PathBuf> {
+/// The blank formatted hard disk xemu needs, copied once from the pinned
+/// template; afterwards it holds the games' saves and is never replaced.
+fn xemu_hard_disk(layout: &PortableLayout) -> RuntimeSetting {
+    RuntimeSetting::SeedCopy {
+        from: layout.emulator_root("xemu").join("xbox_hdd.blank.qcow2"),
+        to: layout
+            .retrobat_root()
+            .join("saves")
+            .join("xbox")
+            .join("xbox_hdd.qcow2"),
+    }
+}
+
+/// A TOML string for `path`: a literal string unless it contains a quote.
+fn toml_string(path: &Path) -> String {
+    let text = path.display().to_string();
+    if text.contains('\'') {
+        format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        format!("'{text}'")
+    }
+}
+
+fn vita3k_plan(
+    layout: &PortableLayout,
+    host: HostPlatform,
+    args: Vec<OsString>,
+) -> Result<LaunchPlan, LaunchError> {
+    let data = crate::vita::data_root(layout);
+    match host {
+        HostPlatform::Linux => {
+            let program = layout.linux_runtime_root().join("Vita3K.AppImage");
+            let mut plan = native_linux_plan(layout, program, args, "vita3k");
+            let config = layout
+                .metadata_root()
+                .join("runtime/linux/vita3k/config/Vita3K/config.yml");
+            plan.settings.extend(vita3k_settings(config, &data));
+            Ok(plan)
+        }
+        HostPlatform::Windows => {
+            let root = layout.emulator_root("vita3k");
+            let mut plan = LaunchPlan::new(root.join("Vita3K.exe"), &root);
+            plan.args = args;
+            plan.settings = vita3k_settings(root.join("config.yml"), &data);
+            Ok(plan)
+        }
+        HostPlatform::Unsupported => Err(LaunchError::Unsupported),
+    }
+}
+
+/// Without these Vita3K opens its first-run setup (and, with no data path,
+/// aborts), shows a welcome screen, checks for updates, shows the game
+/// inside its library window, and logs every trace message.
+fn vita3k_settings(config: PathBuf, data: &Path) -> Vec<RuntimeSetting> {
+    let data = format!("'{}'", data.display().to_string().replace('\'', "''"));
+    [
+        ("initial-setup", "true".to_owned()),
+        ("show-welcome", "false".to_owned()),
+        ("check-for-updates-mode", "0".to_owned()),
+        ("boot-apps-full-screen", "true".to_owned()),
+        ("log-level", "2".to_owned()),
+        ("pref-path", data),
+    ]
+    .into_iter()
+    .map(|(key, value)| RuntimeSetting::YamlValue {
+        path: config.clone(),
+        key: key.to_owned(),
+        value,
+    })
+    .collect()
+}
+
+fn native_linux_plan(
+    layout: &PortableLayout,
+    program: PathBuf,
+    args: Vec<OsString>,
+    emulator: &str,
+) -> LaunchPlan {
     let root = layout
         .metadata_root()
         .join("runtime")
         .join("linux")
         .join(emulator);
-    BTreeMap::from([
-        ("XDG_CONFIG_HOME".to_owned(), root.join("config")),
-        ("XDG_DATA_HOME".to_owned(), root.join("data")),
-        ("XDG_CACHE_HOME".to_owned(), root.join("cache")),
-    ])
+    let config = root.join("config");
+    let mut plan = LaunchPlan::new(program, layout.linux_runtime_root());
+    plan.args = args;
+    plan.env = BTreeMap::from([
+        (
+            "XDG_CONFIG_HOME".to_owned(),
+            config.clone().into_os_string(),
+        ),
+        (
+            "XDG_DATA_HOME".to_owned(),
+            root.join("data").into_os_string(),
+        ),
+        (
+            "XDG_CACHE_HOME".to_owned(),
+            root.join("cache").into_os_string(),
+        ),
+        // Some bundled AppImages carry a self-updater that offers to replace
+        // the AppImage with an unpinned download. These runtimes are pinned
+        // and verified by SHA256SUMS, so updates belong to the bootstrap.
+        ("DISABLE_AUTO_UPDATES".to_owned(), "1".into()),
+    ]);
+    plan.settings = match emulator {
+        // Without a settings file Cemu opens its first-start assistant
+        // instead of the requested game.
+        "cemu" => vec![RuntimeSetting::SeedFile {
+            path: config.join("Cemu").join("settings.xml"),
+            contents: concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+                "<content>\n",
+                "    <check_update>false</check_update>\n",
+                "</content>\n"
+            )
+            .to_owned(),
+        }],
+        // Without these PCSX2 waits in its setup wizard (invisible behind
+        // -nogui), looks for a BIOS in its own data folder, and checks for
+        // updates.
+        "pcsx2" => {
+            let ini = config.join("PCSX2").join("inis").join("PCSX2.ini");
+            let bios = layout
+                .retrobat_root()
+                .join("bios")
+                .join("pcsx2")
+                .join("bios");
+            [
+                ("UI", "SetupWizardIncomplete", "false".to_owned()),
+                ("Folders", "Bios", bios.display().to_string()),
+                ("AutoUpdater", "CheckAtStartup", "false".to_owned()),
+            ]
+            .into_iter()
+            .map(|(section, key, value)| RuntimeSetting::IniValue {
+                path: ini.clone(),
+                section: section.to_owned(),
+                key: key.to_owned(),
+                value,
+            })
+            .collect()
+        }
+        // RPCS3's welcome dialog and its update check both interrupt an
+        // unattended start (the firmware installer runs its GUI).
+        "rpcs3" => {
+            let gui = config
+                .join("rpcs3")
+                .join("GuiConfigs")
+                .join("CurrentSettings.ini");
+            vec![
+                RuntimeSetting::IniValue {
+                    path: gui.clone(),
+                    section: "main_window".to_owned(),
+                    key: "infoBoxEnabledWelcome".to_owned(),
+                    value: "false".to_owned(),
+                },
+                RuntimeSetting::IniValue {
+                    path: gui,
+                    section: "Meta".to_owned(),
+                    key: "checkUpdateStart".to_owned(),
+                    value: "false".to_owned(),
+                },
+            ]
+        }
+        _ => Vec::new(),
+    };
+    plan
 }
 
 fn wine_path(path: &Path) -> Result<PathBuf, LaunchError> {
@@ -579,311 +1422,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn windows_launches_the_bundled_executable_directly() {
-        let layout = PortableLayout::new("X:/Arcade");
-        let plan = LaunchPlan::for_host(&layout, HostPlatform::Windows, None).unwrap();
+    fn wine_addresses_host_paths_through_the_z_drive() {
         assert_eq!(
-            plan.program,
-            PathBuf::from("X:/Arcade/RetroBat/RetroBat.exe")
+            wine_path(Path::new("/opt/retroport/RetroBat/roms/gb/2048.gb")).unwrap(),
+            PathBuf::from(r"Z:\opt\retroport\RetroBat\roms\gb\2048.gb")
         );
-        assert!(plan.args.is_empty());
-    }
-
-    #[test]
-    fn linux_keeps_the_wine_prefix_in_host_user_data() {
-        let layout = PortableLayout::new("/opt/retroport");
-        let plan = LaunchPlan::for_host(
-            &layout,
-            HostPlatform::Linux,
-            Some(Path::new("/home/user/.local/share")),
-        )
-        .unwrap();
-        assert_eq!(plan.program, PathBuf::from("wine"));
-        assert_eq!(
-            plan.env["WINEPREFIX"],
-            PathBuf::from("/home/user/.local/share/retrobat-portable/wine-prefix")
-        );
-        assert_eq!(
-            plan.args,
-            vec![PathBuf::from("/opt/retroport/RetroBat/RetroBat.exe")]
-        );
-    }
-
-    #[test]
-    fn windows_rpcs3_firmware_install_uses_the_bundled_emulator() {
-        let layout = PortableLayout::new("X:/Arcade");
-        let firmware = Path::new("X:/Arcade/RetroBat/bios/PS3UPDAT.PUP");
-        let plan = LaunchPlan::for_rpcs3_firmware_install_host(
-            &layout,
-            HostPlatform::Windows,
-            None,
-            firmware,
-        )
-        .unwrap();
-        assert_eq!(
-            plan.program,
-            PathBuf::from("X:/Arcade/RetroBat/emulators/rpcs3/rpcs3.exe")
-        );
-        assert_eq!(
-            plan.args,
-            vec![PathBuf::from("--installfw"), firmware.to_owned()]
-        );
-    }
-
-    #[test]
-    fn linux_rpcs3_firmware_install_converts_only_the_firmware_path() {
-        let layout = PortableLayout::new("/opt/retroport");
-        let firmware = Path::new("/opt/retroport/RetroBat/bios/PS3UPDAT.PUP");
-        let plan = LaunchPlan::for_rpcs3_firmware_install_host(
-            &layout,
-            HostPlatform::Linux,
-            Some(Path::new("/home/user/.local/share")),
-            firmware,
-        )
-        .unwrap();
-        assert_eq!(plan.program, PathBuf::from("wine"));
-        assert_eq!(
-            plan.args,
-            vec![
-                PathBuf::from("/opt/retroport/RetroBat/emulators/rpcs3/rpcs3.exe"),
-                PathBuf::from("--installfw"),
-                PathBuf::from("Z:\\opt\\retroport\\RetroBat\\bios\\PS3UPDAT.PUP")
-            ]
-        );
-    }
-
-    #[test]
-    fn linux_creates_the_wine_prefix_before_first_launch() {
-        let data_dir = tempfile::tempdir().unwrap();
-        let layout = PortableLayout::new("/opt/retroport");
-        let plan =
-            LaunchPlan::for_host(&layout, HostPlatform::Linux, Some(data_dir.path())).unwrap();
-        let prefix = &plan.env["WINEPREFIX"];
-
-        assert!(!prefix.exists());
-        plan.prepare_runtime().unwrap();
-        assert!(prefix.is_dir());
-    }
-
-    #[test]
-    fn windows_game_launch_uses_retrobat_emulator_launcher() {
-        let layout = PortableLayout::new("X:/Arcade");
-        let rom = Path::new("X:/Arcade/RetroBat/roms/gb/2048.gb");
-        let plan =
-            LaunchPlan::for_game_host(&layout, HostPlatform::Windows, None, "gb", rom).unwrap();
-        assert_eq!(
-            plan.program,
-            PathBuf::from("X:/Arcade/RetroBat/emulationstation/emulatorLauncher.exe")
-        );
-        assert_eq!(
-            plan.args,
-            vec![
-                PathBuf::from("-system"),
-                PathBuf::from("gb"),
-                PathBuf::from("-rom"),
-                rom.to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn launch_can_pin_an_installed_alternative_backend() {
-        let layout = PortableLayout::new("X:/Arcade");
-        let rom = Path::new("X:/Arcade/RetroBat/roms/gamecube/game.rvz");
-        let backend = BackendRoute {
-            emulator: "libretro".to_owned(),
-            core: Some("dolphin".to_owned()),
-            incompatible_extensions: vec![".zip".to_owned()],
-        };
-        let plan = LaunchPlan::for_game_host_with_backend(
-            &layout,
-            HostPlatform::Windows,
-            None,
-            "gamecube",
-            rom,
-            Some(&backend),
-        )
-        .unwrap();
-        assert_eq!(
-            plan.args,
-            vec![
-                PathBuf::from("-system"),
-                PathBuf::from("gamecube"),
-                PathBuf::from("-emulator"),
-                PathBuf::from("libretro"),
-                PathBuf::from("-core"),
-                PathBuf::from("dolphin"),
-                PathBuf::from("-rom"),
-                rom.to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn linux_modern_console_route_uses_the_bundled_native_runtime() {
-        let temp = tempfile::tempdir().unwrap();
-        let layout = PortableLayout::new(temp.path().join("Arcade"));
-        fs::create_dir_all(layout.linux_runtime_root()).unwrap();
-        fs::write(layout.linux_runtime_root().join("Cemu.AppImage"), b"app").unwrap();
-        let rom = layout.retrobat_root().join("roms/wiiu/game.rpx");
-        let backend = BackendRoute {
-            emulator: "cemu".to_owned(),
-            core: None,
-            incompatible_extensions: Vec::new(),
-        };
-        let plan = LaunchPlan::for_game_host_with_backend(
-            &layout,
-            HostPlatform::Linux,
-            None,
-            "wiiu",
-            &rom,
-            Some(&backend),
-        )
-        .unwrap();
-        assert_eq!(
-            plan.program,
-            layout.linux_runtime_root().join("Cemu.AppImage")
-        );
-        assert_eq!(
-            plan.args,
-            vec![PathBuf::from("-g"), rom, PathBuf::from("-f")]
-        );
-        assert!(plan.env["XDG_CONFIG_HOME"].starts_with(layout.metadata_root()));
-    }
-
-    #[test]
-    fn linux_game_launch_converts_the_rom_to_wines_z_drive() {
-        let layout = PortableLayout::new("/opt/retroport");
-        let rom = Path::new("/opt/retroport/RetroBat/roms/gb/2048.gb");
-        let plan = LaunchPlan::for_game_host(
-            &layout,
-            HostPlatform::Linux,
-            Some(Path::new("/home/user/.local/share")),
-            "gb",
-            rom,
-        )
-        .unwrap();
-        assert_eq!(plan.program, PathBuf::from("wine"));
-        assert_eq!(
-            plan.args,
-            vec![
-                PathBuf::from("/opt/retroport/RetroBat/emulationstation/emulatorLauncher.exe"),
-                PathBuf::from("-system"),
-                PathBuf::from("gb"),
-                PathBuf::from("-rom"),
-                PathBuf::from(r"Z:\opt\retroport\RetroBat\roms\gb\2048.gb"),
-            ]
-        );
-    }
-
-    #[test]
-    fn linux_libretro_card_play_bypasses_the_fragile_dotnet_launcher() {
-        let layout = PortableLayout::new("/opt/retroport");
-        let rom = Path::new("/opt/retroport/RetroBat/roms/mame/mspacman.zip");
-        let backend = BackendRoute {
-            emulator: "libretro".to_owned(),
-            core: Some("mame".to_owned()),
-            incompatible_extensions: Vec::new(),
-        };
-        let plan = LaunchPlan::for_game_host_with_backend(
-            &layout,
-            HostPlatform::Linux,
-            Some(Path::new("/home/user/.local/share")),
-            "mame",
-            rom,
-            Some(&backend),
-        )
-        .unwrap();
-
-        assert_eq!(plan.program, PathBuf::from("wine"));
-        assert_eq!(
-            plan.args,
-            vec![
-                layout.retroarch_executable(),
-                PathBuf::from("--appendconfig"),
-                PathBuf::from(r"Z:\opt\retroport\.retrobat-portable\runtime\retroarch\mame.cfg"),
-                PathBuf::from("-L"),
-                PathBuf::from(
-                    r"Z:\opt\retroport\RetroBat\emulators\retroarch\cores\mame_libretro.dll"
-                ),
-                PathBuf::from(r"Z:\opt\retroport\RetroBat\roms\mame\mspacman.zip"),
-            ]
-        );
-        let config = &plan.generated_files[0].1;
-        for expected in [
-            "savefile_directory = \"Z:/opt/retroport/RetroBat/saves/mame\"",
-            "savestate_directory = \"Z:/opt/retroport/RetroBat/saves/mame/states\"",
-            "audio_enable = \"true\"",
-            "audio_driver = \"xaudio\"",
-            "audio_mute_enable = \"false\"",
-            "input_joypad_driver = \"sdl2\"",
-            "input_player1_select_btn = \"4\"",
-            "input_player1_start_btn = \"6\"",
-            "input_player1_select = \"num5\"",
-            "input_player1_start = \"num1\"",
-        ] {
-            assert!(config.contains(expected), "missing {expected}");
-        }
-    }
-
-    #[test]
-    fn direct_libretro_launch_materializes_its_audio_and_input_overrides() {
-        let temp = tempfile::tempdir().unwrap();
-        let layout = PortableLayout::new(temp.path().join("Arcade"));
-        let rom = layout.retrobat_root().join("roms/mame/mspacman.zip");
-        let backend = BackendRoute {
-            emulator: "libretro".to_owned(),
-            core: Some("mame".to_owned()),
-            incompatible_extensions: Vec::new(),
-        };
-        let plan = LaunchPlan::for_game_host_with_backend(
-            &layout,
-            HostPlatform::Linux,
-            Some(temp.path()),
-            "mame",
-            &rom,
-            Some(&backend),
-        )
-        .unwrap();
-
-        plan.prepare_runtime().unwrap();
-
-        let config_path = layout.metadata_root().join("runtime/retroarch/mame.cfg");
-        let config = fs::read_to_string(config_path).unwrap();
-        assert!(config.contains("audio_enable = \"true\""));
-        assert!(config.contains("input_player1_select_btn = \"4\""));
-        assert!(config.contains("input_player1_start = \"num1\""));
-    }
-
-    #[test]
-    fn linux_windows_game_import_launches_the_exe_with_its_companion_directory() {
-        let layout = PortableLayout::new("/opt/retroport");
-        let game = Path::new("/opt/retroport/RetroBat/roms/windows/Game/bin/Game.exe");
-        let backend = BackendRoute {
-            emulator: "windows".to_owned(),
-            core: None,
-            incompatible_extensions: Vec::new(),
-        };
-        let plan = LaunchPlan::for_game_host_with_backend(
-            &layout,
-            HostPlatform::Linux,
-            Some(Path::new("/home/user/.local/share")),
-            "windows",
-            game,
-            Some(&backend),
-        )
-        .unwrap();
-
-        assert_eq!(plan.program, PathBuf::from("wine"));
-        assert_eq!(plan.args, vec![game.to_owned()]);
-        assert_eq!(plan.current_dir, game.parent().unwrap());
+        assert!(matches!(
+            wine_path(Path::new("relative/game.gb")),
+            Err(LaunchError::RelativeWinePath(_))
+        ));
     }
 
     #[test]
     fn game_launch_rejects_a_system_that_could_be_parsed_as_arguments() {
-        let layout = PortableLayout::new("/opt/retroport");
         let result = LaunchPlan::for_game_host(
-            &layout,
+            &PortableLayout::new("/opt/retroport"),
             HostPlatform::Linux,
             Some(Path::new("/home/user/.local/share")),
             "../gb",
@@ -893,45 +1446,30 @@ mod tests {
     }
 
     #[test]
-    fn chip8_launch_uses_the_jaxe_core_directly() {
-        let layout = PortableLayout::new("/opt/retroport");
-        let rom = Path::new("/opt/retroport/RetroBat/roms/chip8/game.ch8");
-        let plan = LaunchPlan::for_game_host(
-            &layout,
-            HostPlatform::Linux,
-            Some(Path::new("/home/user/.local/share")),
-            "chip8",
-            rom,
-        )
-        .unwrap();
-        assert_eq!(plan.program, PathBuf::from("wine"));
+    fn ini_values_are_set_without_disturbing_other_settings() {
+        let original =
+            "[Meta]\nattachCommandLine=false\n\n[main_window]\nlastExplorePathPUP=/media\n";
+        let updated = set_ini_value(original, "main_window", "infoBoxEnabledWelcome", "false");
+        let updated = set_ini_value(&updated, "Meta", "checkUpdateStart", "false");
+        let updated = set_ini_value(&updated, "Meta", "attachCommandLine", "true");
         assert_eq!(
-            plan.args,
-            vec![
-                PathBuf::from("/opt/retroport/RetroBat/emulators/retroarch/retroarch.exe"),
-                PathBuf::from("--appendconfig"),
-                PathBuf::from(r"Z:\opt\retroport\.retrobat-portable\runtime\retroarch\chip8.cfg"),
-                PathBuf::from("-L"),
-                PathBuf::from(
-                    r"Z:\opt\retroport\RetroBat\emulators\retroarch\cores\jaxe_libretro.dll"
-                ),
-                PathBuf::from(r"Z:\opt\retroport\RetroBat\roms\chip8\game.ch8"),
-            ]
+            updated,
+            "[Meta]\nattachCommandLine=true\ncheckUpdateStart=false\n\n[main_window]\nlastExplorePathPUP=/media\ninfoBoxEnabledWelcome=false\n"
+        );
+        assert_eq!(
+            set_ini_value("", "Meta", "checkUpdateStart", "false"),
+            "[Meta]\ncheckUpdateStart=false\n"
         );
     }
 
     #[cfg(unix)]
     #[test]
     fn terminate_kills_the_entire_spawned_process_group() {
-        let mut child = LaunchPlan {
-            program: PathBuf::from("sh"),
-            args: vec![PathBuf::from("-c"), PathBuf::from("sleep 30 & wait")],
-            current_dir: PathBuf::from("/tmp"),
-            env: BTreeMap::new(),
-            generated_files: Vec::new(),
-        }
-        .spawn()
-        .unwrap();
+        let mut child = LaunchPlan::new("sh", "/tmp")
+            .arg("-c")
+            .arg("sleep 30 & wait")
+            .spawn(&|_| {})
+            .unwrap();
         let process_id = child.id();
         assert!(process_tree_is_running(process_id));
 

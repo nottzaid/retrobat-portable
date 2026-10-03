@@ -1,3 +1,4 @@
+use retrobat_portable::artwork::load_or_fetch;
 use retrobat_portable::catalog::Catalog;
 use retrobat_portable::install::{Installer, ReqwestDownloader};
 use retrobat_portable::paths::PortableLayout;
@@ -31,4 +32,3 @@ fn upstream_metadata_and_artifact_match_the_audited_catalog() {
     let uninstall = installer.uninstall(&entry).unwrap();
     assert_eq!(uninstall.removed, vec![report.destination]);
 }
-use retrobat_portable::artwork::load_or_fetch;

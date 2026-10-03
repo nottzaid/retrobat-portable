@@ -3,9 +3,10 @@
     windows_subsystem = "windows"
 )]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -13,29 +14,247 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use retrobat_portable::artwork::{load_bundled_artwork, load_or_fetch, load_snapshot_artwork};
-use retrobat_portable::browse::{
-    Acquisition, BrowseCatalog, BrowseEntry, BundledArtwork, InstallState,
-};
-use retrobat_portable::browse_install::{BrowseInstaller, supports_direct_download};
+use retrobat_portable::browse::{Acquisition, BrowseCatalog, BrowseEntry, BundledArtwork};
+use retrobat_portable::browse_install::{BrowseInstaller, download_route};
 use retrobat_portable::catalog::{Artwork, Catalog, CatalogEntry};
-use retrobat_portable::controller_guard::ControllerMouseGuard;
 use retrobat_portable::controls::{ControlsCatalog, GameControls};
+use retrobat_portable::downloads::PinnedDownload;
 use retrobat_portable::featured::FeaturedCatalog;
-use retrobat_portable::firmware::{import_firmware, install_official_firmware};
-use retrobat_portable::import::{GameImporter, ImportedManifest, imported_manifest, remove_import};
+use retrobat_portable::firmware::{
+    FirmwareFolderReport, FirmwareRecord, Recognition, firmware_record, import_firmware,
+    import_firmware_folder, install_official_firmware,
+};
+use retrobat_portable::import::{
+    GameImporter, ImportedManifest, imported_manifests, remove_import,
+};
 use retrobat_portable::install::{Installer, ReqwestDownloader, is_installed};
-use retrobat_portable::launch::{LaunchPlan, process_tree_is_running, terminate_process_tree_id};
+use retrobat_portable::launch::LaunchPlan;
 use retrobat_portable::paths::PortableLayout;
 use retrobat_portable::readiness::{
     BackendState, FirmwareFileStatus, FirmwareInstallAction, FirmwareState, ReadinessReport,
     SystemReadiness,
 };
+use retrobat_portable::session::{GameSession, SessionEvent, SessionPhase};
+
+// The catalogues are tens of thousands of small strings; mimalloc parses
+// them noticeably faster than the system allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const INPUT_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(7, 9, 13);
 const CONTROL_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(36, 43, 58);
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(104, 146, 255);
 
+/// The Windows build is a GUI program, which Windows starts without a
+/// console. Command-line use (self-check, import, probes) attaches to the
+/// console it was started from so its output and errors are visible.
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    // SAFETY: AttachConsole takes no pointers; failure (no parent console,
+    // or output already redirected) leaves the process unchanged.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+const USAGE: &str = "\
+Usage: RetroPort [--bundle-root FOLDER] [ACTION]
+
+Without an action, RetroPort opens its library.
+
+Actions:
+  --download ID           Download a card's game from its pinned source, verify it, and install it
+  --import ID --file PATH Import your own game file, archive, or folder onto a card
+  --remove ID             Remove what DOWNLOAD or IMPORT placed for a card, keeping modified files
+  --import-firmware PATH  Recognise every BIOS/firmware file in PATH (a file or a folder, searched
+                          recursively) by fingerprint and place each where its emulators look
+  --install-firmware SYS  Download a system's firmware from its maker, verify it, and install it
+                          (ps3, psvita: Sony's official system software)
+  --self-check            Validate the installation and print the report as JSON
+                          (--self-check-output FILE also writes it to FILE)
+  --gameplay-probe ID     Play an installed card through PLAY, hold it, terminate it, and record
+                          every transition (--gameplay-probe-output FILE is required;
+                          --gameplay-probe-seconds N, at least 10, defaults to 20)
+  --install ID            Install an entry of the trusted catalogue
+  --uninstall ID          Remove an entry of the trusted catalogue, keeping modified files
+
+Options:
+  --bundle-root FOLDER    The portable folder to use (default: the one holding this program)
+  --startup-probe-output FILE
+                          Record the library's startup timings to FILE
+  -h, --help              Show this help
+
+A card's ID appears when you hover over its title, for example homebrew-hub/dango-dash.
+";
+
+fn describe_firmware_folder(report: &FirmwareFolderReport) -> String {
+    let mut text = String::new();
+    for (source, target, recognition) in &report.placed {
+        let how = match recognition {
+            Recognition::Fingerprint => "fingerprint",
+            Recognition::Structure => "file structure",
+            Recognition::Name => "file name",
+        };
+        text.push_str(&format!(
+            "Placed bios/{target} from {} (recognised by {how}).\n",
+            source.display()
+        ));
+    }
+    for target in &report.kept_existing {
+        text.push_str(&format!(
+            "Kept your existing bios/{target}; a different file matched it.\n"
+        ));
+    }
+    if report
+        .placed
+        .iter()
+        .any(|(_, target, _)| target == "PS3UPDAT.PUP")
+    {
+        text.push_str(
+            "The PS3 system software is in place; INSTALL FIRMWARE on a PS3 card (or \
+             --install-firmware ps3) installs it into RPCS3.\n",
+        );
+    }
+    text.push_str(&format!(
+        "Examined {} file(s): placed {}, already present {}, unrecognised {}.\n",
+        report.examined,
+        report.placed.len(),
+        report.already_present,
+        report.unrecognised
+    ));
+    text
+}
+
+/// Installs a system's firmware from its maker's own download.
+fn install_firmware_cli(layout: &PortableLayout, system: &str) -> i32 {
+    let browse = match BrowseCatalog::built_in() {
+        Ok(browse) => browse,
+        Err(error) => {
+            eprintln!("Browse catalog rejected: {error}");
+            return 1;
+        }
+    };
+    let report = match ReadinessReport::audit(layout, &browse.entries) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("Readiness audit failed: {error}");
+            return 1;
+        }
+    };
+    let downloadable = report
+        .for_catalog_system(system)
+        .map(|readiness| {
+            readiness
+                .firmware_files
+                .iter()
+                .filter(|file| file.download.is_some())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if downloadable.is_empty() {
+        eprintln!(
+            "{system} has no firmware its maker publishes for download; its card names the file \
+             and how to obtain it, and --import-firmware places it."
+        );
+        return 2;
+    }
+    for firmware in downloadable {
+        if firmware.present {
+            println!("bios/{} is already installed.", firmware.relative_path);
+            continue;
+        }
+        let status = install_one_firmware(layout, &firmware);
+        if status != 0 {
+            return status;
+        }
+    }
+    0
+}
+
+fn install_one_firmware(layout: &PortableLayout, firmware: &FirmwareFileStatus) -> i32 {
+    let download = firmware.download.clone().unwrap();
+    let installed = ReqwestDownloader::new()
+        .map_err(|error| error.to_string())
+        .and_then(|downloader| {
+            install_official_firmware(layout, firmware, &downloader)
+                .map_err(|error| error.to_string())
+        });
+    let report = match installed {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("Firmware installation failed safely: {error}");
+            return 1;
+        }
+    };
+    println!(
+        "Verified {} bytes from {} at {}.",
+        report.bytes,
+        download.publisher,
+        report.destination.display()
+    );
+    let (emulator, plan) = match download.install_action {
+        FirmwareInstallAction::PlaceInBios => return 0,
+        FirmwareInstallAction::Rpcs3 => (
+            "RPCS3",
+            LaunchPlan::for_current_rpcs3_firmware_install(layout, &report.destination),
+        ),
+        FirmwareInstallAction::Vita3k => (
+            "Vita3K",
+            LaunchPlan::for_current_vita3k_firmware_install(layout, &report.destination),
+        ),
+    };
+    println!("Installing it into {emulator}…");
+    let status = plan
+        .and_then(|plan| plan.spawn(&|phase| println!("{phase}")))
+        .and_then(|mut child| child.wait().map_err(Into::into));
+    match status {
+        Ok(status) if status.success() => {
+            println!("{emulator} installed bios/{}.", firmware.relative_path);
+            0
+        }
+        Ok(status) => {
+            eprintln!("{emulator}'s firmware installer exited with {status}.");
+            1
+        }
+        Err(error) => {
+            eprintln!("Could not run {emulator}'s firmware installer: {error}");
+            1
+        }
+    }
+}
+
+fn usage_error(message: &str) -> ! {
+    eprintln!("{message}\nRun RetroPort --help for usage.");
+    std::process::exit(2);
+}
+
+fn flag_path(
+    args: &mut impl Iterator<Item = std::ffi::OsString>,
+    flag: &str,
+    what: &str,
+) -> PathBuf {
+    args.next()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| usage_error(&format!("{flag} requires {what}")))
+}
+
+fn flag_id(args: &mut impl Iterator<Item = std::ffi::OsString>, flag: &str) -> String {
+    args.next()
+        .and_then(|value| value.into_string().ok())
+        .unwrap_or_else(|| usage_error(&format!("{flag} requires a catalogue id")))
+}
+
 fn main() -> eframe::Result {
+    #[cfg(target_os = "windows")]
+    if std::env::args_os().len() > 1 {
+        attach_parent_console();
+    }
     let mut bundle_root = std::env::current_exe()
         .ok()
         .map(|path| PortableLayout::discover(&path).root)
@@ -46,98 +265,76 @@ fn main() -> eframe::Result {
     let mut uninstall_id = None;
     let mut download_id = None;
     let mut import_id = None;
+    let mut remove_id = None;
     let mut import_file = None;
     let mut startup_probe_output = None;
     let mut gameplay_probe_id = None;
     let mut gameplay_probe_output = None;
     let mut gameplay_probe_seconds = 20u64;
-    let mut args = std::env::args().skip(1);
+    let mut firmware_source: Option<PathBuf> = None;
+    let mut firmware_system: Option<String> = None;
+    // Paths are taken as the OS gives them, so a name that is not valid
+    // UTF-8 still reaches the filesystem intact.
+    let mut args = std::env::args_os().skip(1);
     while let Some(argument) = args.next() {
-        match argument.as_str() {
-            "--bundle-root" => {
-                if let Some(value) = args.next() {
-                    bundle_root = PathBuf::from(value);
-                }
+        let Some(flag) = argument.to_str() else {
+            usage_error(&format!("Unknown argument: {}", argument.to_string_lossy()));
+        };
+        match flag {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return Ok(());
             }
+            "--bundle-root" => bundle_root = flag_path(&mut args, flag, "a folder"),
             "--self-check" => self_check_only = true,
-            "--install" => {
-                install_id = args.next();
-                if install_id.is_none() {
-                    eprintln!("--install requires a catalog id");
-                    std::process::exit(2);
-                }
+            "--install" => install_id = Some(flag_id(&mut args, flag)),
+            "--uninstall" => uninstall_id = Some(flag_id(&mut args, flag)),
+            "--download" => download_id = Some(flag_id(&mut args, flag)),
+            "--import" => import_id = Some(flag_id(&mut args, flag)),
+            "--remove" => remove_id = Some(flag_id(&mut args, flag)),
+            "--import-firmware" => {
+                firmware_source = Some(flag_path(&mut args, flag, "a BIOS file or folder"));
             }
-            "--uninstall" => {
-                uninstall_id = args.next();
-                if uninstall_id.is_none() {
-                    eprintln!("--uninstall requires a catalog id");
-                    std::process::exit(2);
-                }
-            }
-            "--download" => {
-                download_id = args.next();
-                if download_id.is_none() {
-                    eprintln!("--download requires a browse catalog id");
-                    std::process::exit(2);
-                }
-            }
-            "--import" => {
-                import_id = args.next();
-                if import_id.is_none() {
-                    eprintln!("--import requires a browse catalog id");
-                    std::process::exit(2);
-                }
-            }
-            "--file" => {
-                import_file = args.next().map(PathBuf::from);
-                if import_file.is_none() {
-                    eprintln!("--file requires a local game path");
-                    std::process::exit(2);
-                }
-            }
+            "--install-firmware" => firmware_system = Some(flag_id(&mut args, flag)),
+            "--file" => import_file = Some(flag_path(&mut args, flag, "a local game path")),
             "--self-check-output" => {
-                self_check_output = args.next().map(PathBuf::from);
-                if self_check_output.is_none() {
-                    eprintln!("--self-check-output requires a path");
-                    std::process::exit(2);
-                }
+                self_check_output = Some(flag_path(&mut args, flag, "a path"));
             }
             "--startup-probe-output" => {
-                startup_probe_output = args.next().map(PathBuf::from);
-                if startup_probe_output.is_none() {
-                    eprintln!("--startup-probe-output requires a path");
-                    std::process::exit(2);
-                }
+                startup_probe_output = Some(flag_path(&mut args, flag, "a path"));
             }
-            "--gameplay-probe" => {
-                gameplay_probe_id = args.next();
-                if gameplay_probe_id.is_none() {
-                    eprintln!("--gameplay-probe requires an imported browse catalog id");
-                    std::process::exit(2);
-                }
-            }
+            "--gameplay-probe" => gameplay_probe_id = Some(flag_id(&mut args, flag)),
             "--gameplay-probe-output" => {
-                gameplay_probe_output = args.next().map(PathBuf::from);
-                if gameplay_probe_output.is_none() {
-                    eprintln!("--gameplay-probe-output requires a path");
-                    std::process::exit(2);
-                }
+                gameplay_probe_output = Some(flag_path(&mut args, flag, "a path"));
             }
             "--gameplay-probe-seconds" => {
                 gameplay_probe_seconds = args
                     .next()
-                    .and_then(|value| value.parse().ok())
+                    .and_then(|value| value.to_str()?.parse().ok())
                     .filter(|seconds| *seconds >= 10)
                     .unwrap_or_else(|| {
-                        eprintln!("--gameplay-probe-seconds requires an integer of at least 10");
-                        std::process::exit(2);
+                        usage_error("--gameplay-probe-seconds requires an integer of at least 10")
                     });
             }
-            other => {
-                eprintln!("Unknown argument: {other}");
-                std::process::exit(2);
-            }
+            other => usage_error(&format!("Unknown argument: {other}")),
         }
+    }
+    let actions = [
+        self_check_only,
+        install_id.is_some(),
+        uninstall_id.is_some(),
+        download_id.is_some(),
+        import_id.is_some(),
+        remove_id.is_some(),
+        gameplay_probe_id.is_some(),
+        firmware_source.is_some(),
+        firmware_system.is_some(),
+    ];
+    if actions.into_iter().filter(|chosen| *chosen).count() > 1 {
+        usage_error(
+            "Choose one action: --self-check, --download, --import, --remove, \
+             --import-firmware, --install-firmware, --gameplay-probe, --install, or --uninstall.",
+        );
     }
 
     let gameplay_probe = gameplay_probe_id.map(|catalog_id| GameplayProbeConfig {
@@ -236,12 +433,7 @@ fn main() -> eframe::Result {
                 eprintln!("Unknown browse catalog id: {requested_id}");
                 std::process::exit(2);
             });
-        let importer = GameImporter::new(&layout);
-        let result = if source.is_dir() {
-            importer.import_directory(entry, &source)
-        } else {
-            importer.import(entry, &source)
-        };
+        let result = GameImporter::new(&layout).import(entry, &source);
         match result {
             Ok(report) => println!(
                 "Imported {} file(s), {} bytes into {}. Launch file: {}",
@@ -252,6 +444,36 @@ fn main() -> eframe::Result {
             ),
             Err(error) => {
                 eprintln!("Import failed safely: {error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    if let Some(source) = firmware_source {
+        match import_firmware_folder(&layout, &source) {
+            Ok(report) => {
+                print!("{}", describe_firmware_folder(&report));
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("Firmware import failed safely: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(system) = firmware_system {
+        std::process::exit(install_firmware_cli(&layout, &system));
+    }
+    if let Some(requested_id) = remove_id {
+        match remove_import(&layout, &requested_id) {
+            Ok(report) => println!(
+                "Removed {} owned file(s); preserved {} modified file(s); {} already absent.",
+                report.removed.len(),
+                report.preserved_modified.len(),
+                report.already_missing.len()
+            ),
+            Err(error) => {
+                eprintln!("Remove failed safely: {error}");
                 std::process::exit(1);
             }
         }
@@ -270,6 +492,17 @@ fn main() -> eframe::Result {
                 eprintln!("Unknown browse catalog id: {requested_id}");
                 std::process::exit(2);
             });
+        if ReadinessReport::audit(&layout, std::slice::from_ref(entry))
+            .ok()
+            .and_then(|report| report.for_catalog_system(&entry.system).cloned())
+            .is_some_and(|system| system.backend == BackendState::EmulatorMissing)
+        {
+            eprintln!(
+                "This installation has no emulator for {}, so the game could not be played; nothing was downloaded.",
+                entry.system
+            );
+            std::process::exit(1);
+        }
         let downloader = ReqwestDownloader::new().unwrap_or_else(|error| {
             eprintln!("Could not initialize downloader: {error}");
             std::process::exit(1);
@@ -296,7 +529,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "RetroBat Portable",
+        "RetroPort",
         options,
         Box::new(move |creation_context| {
             Ok(Box::new(PortableApp::new(
@@ -306,12 +539,53 @@ fn main() -> eframe::Result {
                 gameplay_probe,
             )))
         }),
-    )
+    )?;
+    if GAMEPLAY_PROBE_FAILED.load(Ordering::SeqCst) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// What a backend's own log says about a launch.
+#[derive(serde::Serialize)]
+struct BackendLogEvidence {
+    path: String,
+    core_loaded: bool,
+    content_loaded: bool,
+    errors: Vec<String>,
+}
+
+fn backend_log_evidence(path: &std::path::Path) -> BackendLogEvidence {
+    let text = std::fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let errors = text
+        .lines()
+        .filter(|line| line.contains("[ERROR]"))
+        .take(8)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    BackendLogEvidence {
+        path: path.display().to_string(),
+        core_loaded: text.contains("Loading dynamic libretro core from"),
+        // RetroArch reports core geometry only after retro_load_game accepted
+        // the content, including cores that load their content themselves.
+        content_loaded: text.contains("[Core] Geometry:")
+            && !text.contains("Failed to load content"),
+        errors,
+    }
 }
 
 struct ArtworkMessage {
     entry_id: String,
-    result: Result<DecodedArtwork, String>,
+    result: ArtworkResult,
+}
+
+enum ArtworkResult {
+    Decoded(DecodedArtwork),
+    Failed(String),
+    /// The page that asked for it is no longer shown.
+    Skipped,
 }
 
 struct DecodedArtwork {
@@ -329,24 +603,72 @@ enum ArtworkSource {
 struct ArtworkJob {
     entry_id: String,
     source: ArtworkSource,
+    generation: u64,
 }
 
-// Two readers bound storage and image-decoding pressure. Four simultaneous
-// reads were enough to starve the desktop event loop on slower storage and
-// trigger the compositor's "Application Not Responding" watchdog.
-const ARTWORK_WORKERS: usize = 2;
+// Network fetches mostly wait, so four workers keep remote covers flowing;
+// disk reads and decoding are limited to two at a time because more
+// simultaneous reads starved the desktop event loop on slow storage and
+// tripped the compositor's "Application Not Responding" watchdog.
+const ARTWORK_WORKERS: usize = 4;
+const ARTWORK_LOCAL_PERMITS: usize = 2;
 const ARTWORK_QUEUE_CAPACITY: usize = 64;
+
+/// A counting semaphore for the local read/decode stage.
+struct Permits {
+    available: Mutex<usize>,
+    released: std::sync::Condvar,
+}
+
+impl Permits {
+    fn acquire(&self) -> PermitGuard<'_> {
+        let mut available = self
+            .available
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while *available == 0 {
+            available = self
+                .released
+                .wait(available)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        *available -= 1;
+        PermitGuard(self)
+    }
+}
+
+struct PermitGuard<'a>(&'a Permits);
+
+impl Drop for PermitGuard<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .available
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) += 1;
+        self.0.released.notify_one();
+    }
+}
 
 fn start_artwork_workers(
     layout: PortableLayout,
     completed: mpsc::Sender<ArtworkMessage>,
+    generation: Arc<AtomicU64>,
+    notify: egui::Context,
 ) -> SyncSender<ArtworkJob> {
     let (jobs, receiver) = mpsc::sync_channel::<ArtworkJob>(ARTWORK_QUEUE_CAPACITY);
     let receiver = Arc::new(Mutex::new(receiver));
+    let permits = Arc::new(Permits {
+        available: Mutex::new(ARTWORK_LOCAL_PERMITS),
+        released: std::sync::Condvar::new(),
+    });
     for worker_index in 0..ARTWORK_WORKERS {
         let receiver = Arc::clone(&receiver);
         let completed = completed.clone();
         let layout = layout.clone();
+        let generation = Arc::clone(&generation);
+        let permits = Arc::clone(&permits);
+        let notify = notify.clone();
         thread::Builder::new()
             .name(format!("artwork-{worker_index}"))
             .spawn(move || {
@@ -361,23 +683,34 @@ fn start_artwork_workers(
                     let Ok(job) = job else {
                         return;
                     };
-                    let bytes = match job.source {
-                        ArtworkSource::Snapshot(url) => match &downloader {
-                            Ok(downloader) => load_snapshot_artwork(&layout, &url, downloader)
-                                .map_err(|error| error.to_string()),
-                            Err(error) => Err(error.clone()),
-                        },
-                        ArtworkSource::Verified(artwork) => match &downloader {
-                            Ok(downloader) => load_or_fetch(&layout, &artwork, downloader)
-                                .map_err(|error| error.to_string()),
-                            Err(error) => Err(error.clone()),
-                        },
-                        ArtworkSource::Bundled(artwork) => load_bundled_artwork(&layout, &artwork)
-                            .map_err(|error| error.to_string()),
+                    let result = if job.generation != generation.load(Ordering::SeqCst) {
+                        ArtworkResult::Skipped
+                    } else {
+                        let bytes = match job.source {
+                            ArtworkSource::Snapshot(url) => match &downloader {
+                                Ok(downloader) => load_snapshot_artwork(&layout, &url, downloader)
+                                    .map_err(|error| error.to_string()),
+                                Err(error) => Err(error.clone()),
+                            },
+                            ArtworkSource::Verified(artwork) => match &downloader {
+                                Ok(downloader) => load_or_fetch(&layout, &artwork, downloader)
+                                    .map_err(|error| error.to_string()),
+                                Err(error) => Err(error.clone()),
+                            },
+                            ArtworkSource::Bundled(artwork) => {
+                                let _permit = permits.acquire();
+                                load_bundled_artwork(&layout, &artwork)
+                                    .map_err(|error| error.to_string())
+                            }
+                        };
+                        match bytes.and_then(|bytes| {
+                            let _permit = permits.acquire();
+                            decode_artwork_for_texture(&bytes).map_err(|error| error.to_string())
+                        }) {
+                            Ok(decoded) => ArtworkResult::Decoded(decoded),
+                            Err(error) => ArtworkResult::Failed(error),
+                        }
                     };
-                    let result = bytes.and_then(|bytes| {
-                        decode_artwork_for_texture(&bytes).map_err(|error| error.to_string())
-                    });
                     if completed
                         .send(ArtworkMessage {
                             entry_id: job.entry_id,
@@ -387,6 +720,7 @@ fn start_artwork_workers(
                     {
                         return;
                     }
+                    notify.request_repaint();
                 }
             })
             .expect("artwork worker thread must start");
@@ -394,49 +728,117 @@ fn start_artwork_workers(
     jobs
 }
 
+/// The folder browser shared by the import and firmware dialogs. Listing a
+/// folder touches the disk, so it happens once per folder, not per frame.
+struct FileBrowser {
+    directory: PathBuf,
+    path_text: String,
+    selected: Option<PathBuf>,
+    listing: Vec<(bool, String, PathBuf)>,
+    listed: Option<PathBuf>,
+}
+
+impl FileBrowser {
+    fn new() -> Self {
+        let directory = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self {
+            path_text: directory.display().to_string(),
+            directory,
+            selected: None,
+            listing: Vec::new(),
+            listed: None,
+        }
+    }
+
+    fn open(&mut self, directory: PathBuf) {
+        self.path_text = directory.display().to_string();
+        self.directory = directory;
+        self.selected = None;
+    }
+
+    fn entries(&mut self) -> Vec<(bool, String, PathBuf)> {
+        if self.listed.as_ref() != Some(&self.directory) {
+            self.listing = std::fs::read_dir(&self.directory)
+                .map(|entries| {
+                    let mut listing = entries
+                        .filter_map(Result::ok)
+                        .map(|entry| {
+                            let path = entry.path();
+                            let is_directory = entry.file_type().is_ok_and(|kind| {
+                                kind.is_dir() || (kind.is_symlink() && path.is_dir())
+                            });
+                            (
+                                is_directory,
+                                entry.file_name().to_string_lossy().into_owned(),
+                                path,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    listing.sort_by_cached_key(|(is_directory, name, _)| {
+                        (!*is_directory, name.to_lowercase())
+                    });
+                    listing
+                })
+                .unwrap_or_default();
+            self.listed = Some(self.directory.clone());
+        }
+        self.listing.clone()
+    }
+}
+
 struct ImportDialog {
     entry: BrowseEntry,
-    directory: PathBuf,
-    selected: Option<PathBuf>,
-    path_text: String,
+    browser: FileBrowser,
     message: String,
 }
 
 struct FirmwareDialog {
     system: String,
     files: Vec<FirmwareFileStatus>,
+    records: Vec<Option<FirmwareRecord>>,
     selected_firmware: usize,
-    directory: PathBuf,
-    selected: Option<PathBuf>,
-    path_text: String,
+    browser: FileBrowser,
     message: String,
 }
 
 struct LoadedLibrary {
     catalog: Catalog,
-    browse: BrowseCatalog,
+    browse: Arc<BrowseCatalog>,
     readiness: Option<ReadinessReport>,
     featured_ids: HashSet<String>,
     search_documents: Vec<String>,
-    imported_ids: HashSet<String>,
-    imported_manifests: HashMap<String, ImportedManifest>,
+    imported_manifests: BTreeMap<String, ImportedManifest>,
+    installed_ids: HashSet<String>,
     controls: ControlsCatalog,
     status: String,
+}
+
+/// Something a card asked for; performed after the page is drawn.
+enum CardAction {
+    Import(BrowseEntry),
+    Download(BrowseEntry),
+    Firmware(SystemReadiness),
+    Controls(BrowseEntry),
+    Remove {
+        catalog_id: String,
+        title: String,
+    },
+    Uninstall(CatalogEntry),
+    Terminate,
+    Play {
+        catalog_id: String,
+        title: String,
+        system: String,
+        rom: PathBuf,
+    },
 }
 
 struct OperationResult {
     success: bool,
     heading: String,
     message: String,
-}
-
-struct RunningGame {
-    catalog_id: String,
-    title: String,
-    process_id: u32,
-    exit_receiver: Receiver<String>,
-    launched_at: Instant,
-    termination_requested_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -446,18 +848,21 @@ enum GameButtonIntent {
     Disabled,
 }
 
+/// The card button while a game session exists: LOADING for the first
+/// seconds (a second PLAY is impossible), then TERMINATE, which also cancels
+/// a launch still being prepared.
 fn game_button_state(
-    active: Option<(&str, Duration, bool)>,
+    active: Option<(&str, SessionPhase, Duration)>,
     card_id: &str,
 ) -> (String, GameButtonIntent) {
     match active {
-        Some((id, _, true)) if id == card_id => {
+        Some((id, SessionPhase::Terminating, _)) if id == card_id => {
             ("■  TERMINATING…".to_owned(), GameButtonIntent::Disabled)
         }
-        Some((id, elapsed, false)) if id == card_id && elapsed < Duration::from_secs(5) => {
+        Some((id, _, age)) if id == card_id && age < Duration::from_secs(5) => {
             ("⏳  LOADING…".to_owned(), GameButtonIntent::Disabled)
         }
-        Some((id, _, false)) if id == card_id => {
+        Some((id, _, _)) if id == card_id => {
             ("■  TERMINATE".to_owned(), GameButtonIntent::Terminate)
         }
         Some(_) => ("GAME RUNNING".to_owned(), GameButtonIntent::Disabled),
@@ -465,8 +870,10 @@ fn game_button_state(
     }
 }
 
-fn active_game_repaint_delay(elapsed: Duration, terminating: bool) -> Option<Duration> {
-    (elapsed < Duration::from_secs(5) || terminating).then_some(Duration::from_millis(100))
+fn active_game_repaint_delay(age: Duration, phase: SessionPhase) -> Option<Duration> {
+    (age < Duration::from_secs(5)
+        || matches!(phase, SessionPhase::Preparing | SessionPhase::Terminating))
+    .then_some(Duration::from_millis(100))
 }
 
 fn format_import_size(bytes: u64) -> String {
@@ -501,12 +908,102 @@ struct GameplayProbeConfig {
     duration: Duration,
 }
 
+/// Set when a gameplay probe observes anything other than a launch that runs
+/// until its deadline and then leaves no process behind; the process exits
+/// non-zero so scripted runs cannot mistake a crash for sustained execution.
+static GAMEPLAY_PROBE_FAILED: AtomicBool = AtomicBool::new(false);
+
+const PROBE_RETROARCH_COMMAND_PORT: u16 = 55355;
+
 struct GameplayProbe {
     config: GameplayProbeConfig,
+    created: Instant,
     started: bool,
     deadline_receiver: Option<Receiver<()>>,
+    screenshot_receiver: Option<Receiver<serde_json::Value>>,
     terminating: bool,
     complete_recorded: bool,
+}
+
+/// Asks the running RetroArch for screenshots and describes what the game
+/// was displaying. A game may be between screens (a fade to black or white)
+/// at any one moment, so up to five frames about 1.5 s apart are sampled;
+/// the frame counts as blank only if every sample is.
+fn capture_retroarch_screenshot(screenshots: PathBuf) -> serde_json::Value {
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 1;
+    loop {
+        let mut frame = capture_one_retroarch_screenshot(&screenshots);
+        let blank = frame.get("blank") == Some(&serde_json::Value::Bool(true));
+        if !blank || attempt == ATTEMPTS {
+            frame["samples"] = attempt.into();
+            return frame;
+        }
+        attempt += 1;
+        thread::sleep(Duration::from_millis(1500));
+    }
+}
+
+fn capture_one_retroarch_screenshot(screenshots: &Path) -> serde_json::Value {
+    let started = std::time::SystemTime::now();
+    let sent = std::net::UdpSocket::bind("127.0.0.1:0").and_then(|socket| {
+        socket.send_to(b"SCREENSHOT", ("127.0.0.1", PROBE_RETROARCH_COMMAND_PORT))
+    });
+    if let Err(error) = sent {
+        return serde_json::json!({ "error": format!("command port: {error}") });
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        let newest = std::fs::read_dir(screenshots).ok().and_then(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+                })
+                .filter_map(|entry| {
+                    let modified = entry.metadata().ok()?.modified().ok()?;
+                    (modified >= started).then(|| (modified, entry.path()))
+                })
+                .max()
+        });
+        if let Some((_, path)) = newest {
+            // RetroArch writes the PNG incrementally and, under load, in
+            // bursts; retry decoding until it is complete.
+            let mut last_error = String::new();
+            while Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(250));
+                match image::open(&path) {
+                    Ok(frame) => {
+                        let rgba = frame.to_rgba8();
+                        let mut colors = HashSet::new();
+                        for pixel in rgba.pixels().step_by(7) {
+                            colors.insert(pixel.0);
+                            if colors.len() > 4096 {
+                                break;
+                            }
+                        }
+                        return serde_json::json!({
+                            "path": path.display().to_string(),
+                            "width": rgba.width(),
+                            "height": rgba.height(),
+                            "sampled_colors": colors.len(),
+                            "blank": colors.len() < 2,
+                        });
+                    }
+                    Err(error) => last_error = error.to_string(),
+                }
+            }
+            return serde_json::json!({
+                "path": path.display().to_string(),
+                "error": last_error,
+            });
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    serde_json::json!({ "error": "RetroArch wrote no screenshot within 15 seconds" })
 }
 
 impl GameplayProbe {
@@ -514,19 +1011,35 @@ impl GameplayProbe {
         let _ = std::fs::remove_file(&config.output);
         Self {
             config,
+            created: Instant::now(),
             started: false,
             deadline_receiver: None,
+            screenshot_receiver: None,
             terminating: false,
             complete_recorded: false,
         }
     }
 
-    fn record(&self, event: &str) -> std::io::Result<()> {
+    fn record(&self, event: &str, detail: serde_json::Value) -> std::io::Result<()> {
+        let mut record = serde_json::json!({
+            "event": event,
+            "elapsed_ms": self.created.elapsed().as_millis() as u64,
+        });
+        if let (Some(record), serde_json::Value::Object(detail)) = (record.as_object_mut(), detail)
+        {
+            record.extend(detail);
+        }
         let mut output = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.config.output)?;
-        writeln!(output, "{{\"event\":\"{event}\"}}")
+        writeln!(output, "{record}")?;
+        output.sync_data()
+    }
+
+    fn fail(&self, event: &str, detail: serde_json::Value) {
+        GAMEPLAY_PROBE_FAILED.store(true, Ordering::SeqCst);
+        let _ = self.record(event, detail);
     }
 }
 
@@ -565,29 +1078,26 @@ struct BrowseViewKey {
 }
 
 impl FirmwareDialog {
-    fn new(readiness: &SystemReadiness) -> Self {
-        let directory = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
+    fn new(readiness: &SystemReadiness, layout: &PortableLayout) -> Self {
         let files = readiness.firmware_files.clone();
         let selected_firmware = files.iter().position(|file| !file.present).unwrap_or(0);
+        let records = files
+            .iter()
+            .map(|file| firmware_record(layout, &file.relative_path))
+            .collect();
         Self {
             system: readiness.catalog_system.clone(),
             files,
+            records,
             selected_firmware,
-            path_text: directory.display().to_string(),
-            directory,
-            selected: None,
-            message: "Choose the firmware target, then select the file you obtained. Known hashes are informational, not a gate.".to_owned(),
+            browser: FileBrowser::new(),
+            message: "Select the file for a target below, or open the folder holding your BIOS files and let RetroPort recognise every one by fingerprint (dropping a folder here does the same). RetroPort records each file's SHA-256; an unfamiliar dump is never rejected.".to_owned(),
         }
     }
 }
 
 impl ImportDialog {
     fn new(entry: BrowseEntry) -> Self {
-        let directory = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
         let message = if entry.system.eq_ignore_ascii_case("mame") {
             "Select the intact MAME ROM-set ZIP (for example, mspacman.zip). If it came inside a RAR archive, select the RAR and RetroPort will unpack it."
         } else {
@@ -595,9 +1105,7 @@ impl ImportDialog {
         };
         Self {
             entry,
-            path_text: directory.display().to_string(),
-            directory,
-            selected: None,
+            browser: FileBrowser::new(),
             message: message.to_owned(),
         }
     }
@@ -605,27 +1113,33 @@ impl ImportDialog {
 
 struct PortableApp {
     context: egui::Context,
-    root_text: String,
+    layout: PortableLayout,
     catalog: Catalog,
     status: String,
     operation: Option<Receiver<OperationResult>>,
     operation_notice: Option<OperationResult>,
-    running_game: Option<RunningGame>,
+    running_game: Option<GameSession>,
     artwork_jobs: SyncSender<ArtworkJob>,
     artwork_receiver: Receiver<ArtworkMessage>,
-    textures: HashMap<String, egui::TextureHandle>,
+    /// Uploaded covers with the frame that last showed them.
+    textures: HashMap<String, (egui::TextureHandle, u64)>,
+    frame_number: u64,
+    artwork_generation: Arc<AtomicU64>,
     artwork_errors: HashMap<String, String>,
     artwork_pending: usize,
     artwork_inflight: HashSet<String>,
-    browse: BrowseCatalog,
+    browse: Arc<BrowseCatalog>,
     readiness: Option<ReadinessReport>,
     readiness_refresh: Option<Receiver<Result<ReadinessReport, String>>>,
     featured_ids: HashSet<String>,
     search_documents: Vec<String>,
-    imported_ids: HashSet<String>,
-    imported_manifests: HashMap<String, ImportedManifest>,
+    imported_manifests: BTreeMap<String, ImportedManifest>,
+    /// Trusted-catalogue installs made by earlier versions (PLAY + REMOVE).
+    installed_ids: HashSet<String>,
+    retrobat_present: bool,
     controls: Option<ControlsCatalog>,
     browse_view_key: Option<BrowseViewKey>,
+    browse_page_key: Option<(Option<BrowseViewKey>, usize)>,
     browse_systems: Vec<String>,
     browse_matches: Vec<usize>,
     browse_page: usize,
@@ -667,12 +1181,50 @@ fn load_library(layout: &PortableLayout) -> LoadedLibrary {
             entries: Vec::new(),
         }
     });
-    let readiness = match ReadinessReport::audit(layout, &browse.entries) {
+    // Everything below depends only on the parsed catalogue; run it
+    // side by side so the library is ready as soon as the slowest part is.
+    let (readiness, search_documents, featured_ids, imported, controls) =
+        std::thread::scope(|scope| {
+            let readiness = scope.spawn(|| ReadinessReport::audit(layout, &browse.entries));
+            let featured = scope.spawn(|| FeaturedCatalog::built_in(&browse));
+            let imported = scope.spawn(|| imported_manifests(layout));
+            let controls = scope.spawn(ControlsCatalog::built_in);
+            let search_documents = browse
+                .entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{} {} {} {} {} {} {} {} {}",
+                        entry.title,
+                        entry.developer,
+                        entry.system,
+                        entry.source_id,
+                        entry.description,
+                        entry.license.as_deref().unwrap_or_default(),
+                        entry
+                            .release_year
+                            .map(|year| year.to_string())
+                            .unwrap_or_default(),
+                        entry.tags.join(" "),
+                        entry.kind,
+                    )
+                    .to_lowercase()
+                })
+                .collect::<Vec<_>>();
+            (
+                readiness.join().expect("readiness audit thread"),
+                search_documents,
+                featured.join().expect("featured thread"),
+                imported.join().expect("import record thread"),
+                controls.join().expect("controls thread"),
+            )
+        });
+    let readiness = match readiness {
         Ok(report) => {
             status = format!(
-                "{status} Backend audit: {} title(s) ready now, {} provisioned on first play, {} unresolved.",
+                "{status} Backend audit: {} title(s) ready now, {} without an installed emulator, {} unresolved.",
                 report.ready_now_entries,
-                report.provision_on_first_play_entries,
+                report.emulator_missing_entries,
                 report.unresolved_entries
             );
             Some(report)
@@ -682,63 +1234,32 @@ fn load_library(layout: &PortableLayout) -> LoadedLibrary {
             None
         }
     };
-    let search_documents = browse
-        .entries
-        .iter()
-        .map(|entry| {
-            format!(
-                "{} {} {} {} {} {} {} {} {}",
-                entry.title,
-                entry.developer,
-                entry.system,
-                entry.source_id,
-                entry.description,
-                entry.license.as_deref().unwrap_or_default(),
-                entry
-                    .release_year
-                    .map(|year| year.to_string())
-                    .unwrap_or_default(),
-                entry.tags.join(" "),
-                entry.kind,
-            )
-            .to_ascii_lowercase()
-        })
-        .collect();
-    let featured_ids = FeaturedCatalog::built_in(&browse)
+    let featured_ids = featured_ids
         .map(|featured| featured.entry_ids)
         .unwrap_or_else(|error| {
             eprintln!("Featured snapshot rejected: {error}");
             HashSet::new()
         });
-    let imported_manifests = load_imported_manifests(layout);
-    let imported_ids = imported_manifests.keys().cloned().collect();
+    let installed_ids = installed_trusted_ids(layout, &catalog);
     LoadedLibrary {
         catalog,
-        browse,
+        browse: Arc::new(browse),
         readiness,
         featured_ids,
         search_documents,
-        imported_ids,
-        imported_manifests,
-        controls: ControlsCatalog::built_in().expect("built-in controls snapshot must validate"),
+        imported_manifests: imported,
+        installed_ids,
+        controls: controls.expect("built-in controls snapshot must validate"),
         status,
     }
 }
 
-fn load_imported_manifests(layout: &PortableLayout) -> HashMap<String, ImportedManifest> {
-    let Ok(entries) = std::fs::read_dir(layout.imported_root()) else {
-        return HashMap::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| std::fs::File::open(entry.path()).ok())
-        .filter_map(|file| serde_json::from_reader::<_, ImportedManifest>(file).ok())
-        .filter_map(|manifest| {
-            imported_manifest(layout, &manifest.catalog_id)
-                .ok()
-                .flatten()
-                .map(|validated| (validated.catalog_id.clone(), validated))
-        })
+fn installed_trusted_ids(layout: &PortableLayout, catalog: &Catalog) -> HashSet<String> {
+    catalog
+        .entries
+        .iter()
+        .filter(|entry| is_installed(layout, entry))
+        .map(|entry| entry.id.clone())
         .collect()
 }
 
@@ -774,7 +1295,13 @@ impl PortableApp {
         context.set_visuals(visuals);
 
         let (artwork_sender, artwork_receiver) = mpsc::channel();
-        let artwork_jobs = start_artwork_workers(layout.clone(), artwork_sender.clone());
+        let artwork_generation = Arc::new(AtomicU64::new(0));
+        let artwork_jobs = start_artwork_workers(
+            layout.clone(),
+            artwork_sender,
+            Arc::clone(&artwork_generation),
+            context.clone(),
+        );
         let (loading_sender, loading_receiver) = mpsc::channel();
         let loading_layout = layout.clone();
         thread::spawn(move || {
@@ -782,7 +1309,7 @@ impl PortableApp {
         });
         Self {
             context: context.clone(),
-            root_text: layout.root.display().to_string(),
+            layout: layout.clone(),
             catalog: Catalog {
                 schema_version: 1,
                 generated_at: String::new(),
@@ -795,23 +1322,27 @@ impl PortableApp {
             artwork_jobs,
             artwork_receiver,
             textures: HashMap::new(),
+            frame_number: 0,
+            artwork_generation,
             artwork_errors: HashMap::new(),
             artwork_pending: 0,
             artwork_inflight: HashSet::new(),
-            browse: BrowseCatalog {
+            browse: Arc::new(BrowseCatalog {
                 schema_version: 2,
                 generated_at: String::new(),
                 sources: Vec::new(),
                 entries: Vec::new(),
-            },
+            }),
             readiness: None,
             readiness_refresh: None,
             featured_ids: HashSet::new(),
             search_documents: Vec::new(),
-            imported_ids: HashSet::new(),
-            imported_manifests: HashMap::new(),
+            imported_manifests: BTreeMap::new(),
+            installed_ids: HashSet::new(),
+            retrobat_present: layout.retrobat_executable().is_file(),
             controls: None,
             browse_view_key: None,
+            browse_page_key: None,
             browse_systems: Vec::new(),
             browse_matches: Vec::new(),
             browse_page: 0,
@@ -835,6 +1366,7 @@ impl PortableApp {
             match self.artwork_jobs.try_send(ArtworkJob {
                 entry_id: entry_id.clone(),
                 source,
+                generation: self.artwork_generation.load(Ordering::SeqCst),
             }) {
                 Ok(()) => self.artwork_pending += 1,
                 Err(TrySendError::Full(_)) => {
@@ -855,100 +1387,472 @@ impl PortableApp {
         let key = BrowseViewKey {
             source: self.source_filter.clone(),
             system: self.system_filter.clone(),
-            query: self.search.trim().to_ascii_lowercase(),
+            query: self.search.trim().to_lowercase(),
         };
         if self.browse_view_key.as_ref() == Some(&key) {
             return;
         }
-
+        let in_collection = |entry: &BrowseEntry| {
+            key.source == "all"
+                || (key.source == "featured" && self.featured_ids.contains(&entry.id))
+                || entry.source_id == key.source
+        };
         self.browse_systems = self
             .browse
             .entries
             .iter()
-            .filter(|entry| {
-                key.source == "all"
-                    || (key.source == "featured" && self.featured_ids.contains(&entry.id))
-                    || entry.source_id == key.source
-            })
+            .filter(|entry| in_collection(entry))
             .map(|entry| entry.system.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
 
-        self.browse_matches = self
-            .browse
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(index, entry)| {
-                if !key.query.is_empty() {
-                    // Search is intentionally global and ignores collection/system filters.
-                    self.search_documents[*index].contains(&key.query)
-                } else {
-                    let collection_matches = key.source == "all"
-                        || (key.source == "featured" && self.featured_ids.contains(&entry.id))
-                        || entry.source_id == key.source;
-                    let system_matches = key.system == "all" || entry.system == key.system;
-                    collection_matches && system_matches
-                }
-            })
-            .map(|(index, _)| index)
-            .collect();
-        if !key.query.is_empty() {
-            self.browse_matches.sort_by_cached_key(|index| {
-                let entry = &self.browse.entries[*index];
-                (
-                    !self.imported_ids.contains(&entry.id),
-                    entry.title.to_ascii_lowercase() != key.query,
-                    entry.title.to_ascii_lowercase(),
-                    entry.system.clone(),
-                )
-            });
+        if key.query.is_empty() {
+            self.browse_matches = self
+                .browse
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    in_collection(entry) && (key.system == "all" || entry.system == key.system)
+                })
+                .map(|(index, _)| index)
+                .collect();
+        } else {
+            // Search is intentionally global and ignores collection/system
+            // filters. Every word must appear somewhere in the record.
+            let terms = key.query.split_whitespace().collect::<Vec<_>>();
+            let mut ranked = self
+                .search_documents
+                .iter()
+                .enumerate()
+                .filter(|(_, document)| terms.iter().all(|term| document.contains(term)))
+                .map(|(index, _)| {
+                    let entry = &self.browse.entries[index];
+                    let title = entry.title.to_lowercase();
+                    let tier = if title == key.query {
+                        0
+                    } else if title.starts_with(&key.query) {
+                        1
+                    } else if terms.iter().all(|term| title.contains(term)) {
+                        2
+                    } else {
+                        3
+                    };
+                    (
+                        tier,
+                        !self.imported_manifests.contains_key(&entry.id),
+                        title,
+                        index,
+                    )
+                })
+                .collect::<Vec<_>>();
+            ranked.sort_unstable();
+            self.browse_matches = ranked.into_iter().map(|(_, _, _, index)| index).collect();
         }
         self.browse_view_key = Some(key);
     }
 
-    fn start_install(&mut self, entry: CatalogEntry) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+    /// Draws one catalogue card, collecting what the user asked for into
+    /// `actions`. Returns the artwork request when its cover is not loaded.
+    fn card(
+        &self,
+        ui: &mut egui::Ui,
+        entry: &BrowseEntry,
+        card_width: f32,
+        artwork_height: f32,
+        actions: &mut Vec<CardAction>,
+    ) -> Option<(String, ArtworkSource)> {
+        const CARD: egui::Color32 = egui::Color32::from_rgb(22, 27, 38);
+        const GOOD: egui::Color32 = egui::Color32::from_rgb(98, 211, 145);
+        const WARN: egui::Color32 = egui::Color32::from_rgb(238, 177, 89);
+        const BAD: egui::Color32 = egui::Color32::from_rgb(235, 113, 113);
+        let mut artwork_request = None;
+        egui::Frame::new()
+            .fill(CARD)
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(43, 51, 69)))
+            .corner_radius(10)
+            .inner_margin(10)
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.set_min_width(card_width);
+                    ui.set_max_width(card_width);
+                    let size = egui::vec2(card_width, artwork_height);
+                    if let Some((texture, _)) = self.textures.get(&entry.id) {
+                        ui.add(
+                            egui::Image::new((texture.id(), size))
+                                .fit_to_exact_size(size)
+                                .corner_radius(7),
+                        );
+                    } else {
+                        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                        let sourced = entry.artwork_asset.is_some() || entry.artwork_url.is_some();
+                        let failed = self.artwork_errors.contains_key(&entry.id);
+                        if sourced && !failed {
+                            ui.painter().rect_filled(rect, 7, egui::Color32::from_rgb(28, 35, 49));
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "LOADING…",
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::from_gray(130),
+                            );
+                            if !self.artwork_inflight.contains(&entry.id) {
+                                let source = self
+                                    .catalog
+                                    .entries
+                                    .iter()
+                                    .find(|trusted| trusted.id == entry.id)
+                                    .and_then(|trusted| trusted.artwork.first().cloned())
+                                    .map(ArtworkSource::Verified)
+                                    .or_else(|| entry.artwork_asset.clone().map(ArtworkSource::Bundled))
+                                    .or_else(|| entry.artwork_url.clone().map(ArtworkSource::Snapshot));
+                                artwork_request = source.map(|source| (entry.id.clone(), source));
+                            }
+                        } else {
+                            paint_generated_artwork(ui.painter(), rect, entry);
+                        }
+                    }
+                    ui.add_space(5.0);
+                    ui.label(egui::RichText::new(&entry.title).strong().color(egui::Color32::WHITE))
+                        .on_hover_text(format!("Card ID: {}", entry.id));
+                    let source_name = self
+                        .browse
+                        .sources
+                        .iter()
+                        .find(|source| source.id == entry.source_id)
+                        .map_or(entry.source_id.as_str(), |source| source.name.as_str());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}  ·  {}{}",
+                            entry.system.to_ascii_uppercase(),
+                            source_name,
+                            entry
+                                .release_year
+                                .map(|year| format!("  ·  {year}"))
+                                .unwrap_or_default()
+                        ))
+                        .small()
+                        .color(egui::Color32::from_gray(145)),
+                    );
+                    ui.label(
+                        egui::RichText::new(&entry.developer)
+                            .small()
+                            .color(egui::Color32::from_gray(165)),
+                    );
+                    if let Some(license) = &entry.license {
+                        ui.label(egui::RichText::new(license).small().color(egui::Color32::from_gray(125)));
+                    }
+                    let download = (entry.acquisition == Acquisition::DirectDownload)
+                        .then(|| download_route(entry));
+                    let (trust, trust_color, trust_detail) = match &download {
+                        Some(Ok(pinned)) => (
+                            "VERIFIED DOWNLOAD",
+                            GOOD,
+                            format!(
+                                "Fetched from {} and checked against its pinned SHA-256 ({}) before anything is installed.",
+                                pinned.url,
+                                format_import_size(pinned.size)
+                            ),
+                        ),
+                        Some(Err(reason)) => (
+                            "SOURCE UNAVAILABLE",
+                            egui::Color32::from_gray(145),
+                            format!("No verified download exists for this game: {reason}."),
+                        ),
+                        None => (
+                            "LOCAL COPY REQUIRED",
+                            egui::Color32::from_gray(145),
+                            "Import your own copy of this game.".to_owned(),
+                        ),
+                    };
+                    ui.label(egui::RichText::new(trust).small().strong().color(trust_color))
+                        .on_hover_text(trust_detail);
+                    if let Some(readiness) = self
+                        .readiness
+                        .as_ref()
+                        .and_then(|report| report.for_catalog_system(&entry.system))
+                    {
+                        let (label, color, detail) = match readiness.backend {
+                            BackendState::ReadyNow => (
+                                "BACKEND READY",
+                                GOOD,
+                                readiness.ready_route.as_ref().map_or_else(
+                                    || "An installed emulator route is available.".to_owned(),
+                                    |route| format!("Installed route: {}", route.label()),
+                                ),
+                            ),
+                            BackendState::EmulatorMissing => (
+                                "EMULATOR NOT INSTALLED",
+                                BAD,
+                                "RetroBat lists an emulator for this system, but this installation does not include it, so PLAY cannot start these games.".to_owned(),
+                            ),
+                            BackendState::Unresolved => (
+                                "BACKEND NOT YET RESOLVED",
+                                BAD,
+                                "No RetroBat system adapter is currently mapped for this catalogue system.".to_owned(),
+                            ),
+                        };
+                        ui.label(egui::RichText::new(label).small().strong().color(color))
+                            .on_hover_text(detail);
+                        if readiness.firmware == FirmwareState::RequiredMissing {
+                            ui.label(egui::RichText::new("FIRMWARE SETUP REQUIRED").small().color(WARN))
+                                .on_hover_text(format!(
+                                    "The selected installed backend declares {} required firmware file(s); none were detected.",
+                                    readiness.firmware_candidates
+                                ));
+                        }
+                        if !readiness.firmware_files.is_empty() {
+                            let missing = |optional: bool| {
+                                readiness
+                                    .firmware_files
+                                    .iter()
+                                    .filter(|file| !file.present && file.optional == optional)
+                                    .collect::<Vec<_>>()
+                            };
+                            let (required, optional) = (missing(false), missing(true));
+                            let label = match (required.is_empty(), optional.is_empty()) {
+                                (false, _) if required.iter().any(|file| file.download.is_some()) => "INSTALL FIRMWARE",
+                                (false, _) => "IMPORT FIRMWARE",
+                                (true, false) if optional.iter().any(|file| file.download.is_some()) => {
+                                    "INSTALL OPTIONAL FIRMWARE"
+                                }
+                                (true, false) => "IMPORT OPTIONAL FIRMWARE",
+                                (true, true) => "MANAGE FIRMWARE",
+                            };
+                            if ui
+                                .add_enabled(
+                                    self.operation.is_none(),
+                                    egui::Button::new(egui::RichText::new(label).small().strong())
+                                        .fill(CONTROL_BACKGROUND),
+                                )
+                                .clicked()
+                            {
+                                actions.push(CardAction::Firmware(readiness.clone()));
+                            }
+                        }
+                    }
+                    if let Some(url) = &entry.detail_url {
+                        ui.hyperlink_to(egui::RichText::new("SOURCE DETAILS").small().color(ACCENT), url);
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("⌨  CONTROLS").small().strong())
+                                .fill(CONTROL_BACKGROUND)
+                                .min_size(egui::vec2(122.0, 26.0)),
+                        )
+                        .on_hover_text(
+                            "Available before import: guidance comes from the catalogue's MAME/RetroBat metadata and the installed RetroArch/controller configuration, not from inspecting ROM bytes.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(CardAction::Controls(entry.clone()));
+                    }
+                    ui.add_space(3.0);
+                    self.card_game_buttons(ui, entry, download.as_ref(), actions);
+                });
+            });
+        artwork_request
+    }
+
+    /// PLAY/TERMINATE, IMPORT GAME or DOWNLOAD, and REMOVE for one card.
+    fn card_game_buttons(
+        &self,
+        ui: &mut egui::Ui,
+        entry: &BrowseEntry,
+        download: Option<&Result<&'static PinnedDownload, String>>,
+        actions: &mut Vec<CardAction>,
+    ) {
+        let imported = self.imported_manifests.get(&entry.id);
+        let trusted = self
+            .catalog
+            .entries
+            .iter()
+            .find(|trusted| trusted.id == entry.id)
+            .filter(|trusted| self.installed_ids.contains(&trusted.id));
+        let playable = imported
+            .map(|manifest| {
+                (
+                    manifest.system.clone(),
+                    self.layout.root.join(&manifest.launch_relative_path),
+                )
+            })
+            .or_else(|| {
+                trusted.map(|trusted| {
+                    (
+                        trusted.system.clone(),
+                        self.layout.root.join(trusted.install_relative_path()),
+                    )
+                })
+            });
+        let busy = self.operation.is_some();
+        // A game whose system has no installed emulator could be fetched but
+        // never started.
+        let emulator_missing = self
+            .readiness
+            .as_ref()
+            .and_then(|report| report.for_catalog_system(&entry.system))
+            .is_some_and(|system| system.backend == BackendState::EmulatorMissing);
+        let (label, intent) = match &playable {
+            Some(_) if emulator_missing => ("NO EMULATOR".to_owned(), GameButtonIntent::Disabled),
+            Some(_) => game_button_state(
+                self.running_game
+                    .as_ref()
+                    .map(|game| (game.catalog_id.as_str(), game.phase(), game.age())),
+                &entry.id,
+            ),
+            None => match download {
+                Some(Ok(_)) if emulator_missing => {
+                    ("NO EMULATOR".to_owned(), GameButtonIntent::Disabled)
+                }
+                Some(Ok(_)) => ("DOWNLOAD".to_owned(), GameButtonIntent::Play),
+                Some(Err(_)) => ("UNAVAILABLE".to_owned(), GameButtonIntent::Disabled),
+                None => ("IMPORT GAME".to_owned(), GameButtonIntent::Play),
+            },
+        };
+        let wide = entry.acquisition == Acquisition::DirectDownload;
+        let width = if wide { 150.0 } else { 122.0 };
+        if ui
+            .add_enabled(
+                !busy && intent != GameButtonIntent::Disabled,
+                egui::Button::new(
+                    egui::RichText::new(&label)
+                        .small()
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(ACCENT)
+                .min_size(egui::vec2(width, 28.0)),
+            )
+            .clicked()
+        {
+            actions.push(match (intent, playable) {
+                (GameButtonIntent::Terminate, _) => CardAction::Terminate,
+                (_, Some((system, rom))) => CardAction::Play {
+                    catalog_id: entry.id.clone(),
+                    title: entry.title.clone(),
+                    system,
+                    rom,
+                },
+                (_, None) if download.is_some() => CardAction::Download(entry.clone()),
+                (_, None) => CardAction::Import(entry.clone()),
+            });
+        }
+        if imported.is_some() || trusted.is_some() {
+            let removable = remove_import_available(true, busy, self.running_game.is_some());
+            if ui
+                .add_enabled(
+                    removable,
+                    egui::Button::new(egui::RichText::new("REMOVE").small().strong())
+                        .fill(egui::Color32::from_rgb(113, 47, 55))
+                        .min_size(egui::vec2(width, 26.0)),
+                )
+                .on_hover_text(
+                    "Remove the files this card installed and return it to its first action. Files you changed since are kept.",
+                )
+                .clicked()
+            {
+                actions.push(match trusted {
+                    Some(trusted) if imported.is_none() => CardAction::Uninstall(trusted.clone()),
+                    _ => CardAction::Remove {
+                        catalog_id: entry.id.clone(),
+                        title: entry.title.clone(),
+                    },
+                });
+            }
+        }
+    }
+
+    fn perform(&mut self, action: CardAction) {
+        match action {
+            CardAction::Import(entry) => self.import_dialog = Some(ImportDialog::new(entry)),
+            CardAction::Download(entry) => self.start_browse_download(entry),
+            CardAction::Firmware(readiness) => {
+                self.firmware_dialog = Some(FirmwareDialog::new(&readiness, &self.layout));
+            }
+            CardAction::Controls(entry) => {
+                if let Some(controls) = &self.controls {
+                    let imported = self.imported_manifests.get(&entry.id);
+                    self.controls_dialog = Some(controls.for_game(
+                        &self.layout,
+                        &entry,
+                        imported,
+                        self.readiness.as_ref(),
+                    ));
+                }
+            }
+            CardAction::Remove { catalog_id, title } => self.start_remove_import(catalog_id, title),
+            CardAction::Uninstall(entry) => self.start_uninstall(entry),
+            CardAction::Terminate => self.terminate_running_game(),
+            CardAction::Play {
+                catalog_id,
+                title,
+                system,
+                rom,
+            } => self.launch_game(&catalog_id, &title, &system, &rom),
+        }
+    }
+
+    fn evict_textures(&mut self) {
+        // Keep the current page and recent ones; a cover is at most 1 MiB of
+        // GPU memory, so 150 bounds the cache near 150 MiB however far the
+        // user browses.
+        const KEEP: usize = 150;
+        if self.textures.len() <= KEEP {
+            return;
+        }
+        let mut by_age = self
+            .textures
+            .iter()
+            .map(|(id, (_, frame))| (*frame, id.clone()))
+            .collect::<Vec<_>>();
+        by_age.sort_unstable();
+        for (_, id) in by_age.into_iter().take(self.textures.len() - KEEP) {
+            self.textures.remove(&id);
+        }
+    }
+
+    /// Removes a game an earlier RetroPort version installed through the
+    /// trusted catalogue (its record lives in .retrobat-portable/installed).
+    fn start_uninstall(&mut self, entry: CatalogEntry) {
+        let layout = self.layout.clone();
         let (sender, receiver) = mpsc::channel();
         self.operation = Some(receiver);
-        self.status = format!("Downloading and verifying {}…", entry.title);
+        self.status = format!("Removing {}…", entry.title);
+        let context = self.context.clone();
         thread::spawn(move || {
             let result = ReqwestDownloader::new()
-                .and_then(|downloader| Installer::new(&layout, &downloader).install(&entry));
-            let result = match result {
+                .and_then(|downloader| Installer::new(&layout, &downloader).uninstall(&entry));
+            let _ = sender.send(match result {
                 Ok(report) => OperationResult {
                     success: true,
-                    heading: "INSTALL COMPLETE".to_owned(),
+                    heading: "GAME REMOVED".to_owned(),
                     message: format!(
-                        "Installed and verified {} bytes at {}.",
-                        report.bytes,
-                        report.destination.display()
+                        "Removed {}: {} owned file(s) deleted, {} modified file(s) preserved.",
+                        entry.title,
+                        report.removed.len(),
+                        report.preserved_modified.len()
                     ),
                 },
                 Err(error) => OperationResult {
                     success: false,
-                    heading: "INSTALL FAILED".to_owned(),
-                    message: format!("Install failed safely: {error}"),
+                    heading: "REMOVE FAILED".to_owned(),
+                    message: format!("Could not remove {}: {error}", entry.title),
                 },
-            };
-            let _ = sender.send(result);
+            });
+            context.request_repaint();
         });
     }
 
     fn start_import_path(&mut self, entry: BrowseEntry, source: PathBuf) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         let (sender, receiver) = mpsc::channel();
         self.operation = Some(receiver);
         self.status = format!("Copying and preparing {}…", entry.title);
         thread::spawn(move || {
             let title = entry.title.clone();
-            let importer = GameImporter::new(&layout);
-            let result = if source.is_dir() {
-                importer.import_directory(&entry, &source)
-            } else {
-                importer.import(&entry, &source)
-            };
+            let result = GameImporter::new(&layout).import(&entry, &source);
             let result = match result {
                 Ok(report) => OperationResult {
                     success: true,
@@ -970,7 +1874,7 @@ impl PortableApp {
     }
 
     fn start_remove_import(&mut self, catalog_id: String, title: String) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         let (sender, receiver) = mpsc::channel();
         self.operation = Some(receiver);
         self.status = format!("Removing imported {title}…");
@@ -997,7 +1901,7 @@ impl PortableApp {
     }
 
     fn start_firmware_import(&mut self, firmware: FirmwareFileStatus, source: PathBuf) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         let (sender, receiver) = mpsc::channel();
         self.operation = Some(receiver);
         self.status = format!("Adding firmware at bios/{}…", firmware.relative_path);
@@ -1029,8 +1933,34 @@ impl PortableApp {
         });
     }
 
+    fn start_firmware_folder_import(&mut self, folder: PathBuf) {
+        let layout = self.layout.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.operation = Some(receiver);
+        self.status = format!("Recognising BIOS files in {}…", folder.display());
+        thread::spawn(move || {
+            let result = match import_firmware_folder(&layout, &folder) {
+                Ok(report) => OperationResult {
+                    success: true,
+                    heading: if report.placed.is_empty() {
+                        "NO NEW FIRMWARE FOUND".to_owned()
+                    } else {
+                        "FIRMWARE READY".to_owned()
+                    },
+                    message: describe_firmware_folder(&report),
+                },
+                Err(error) => OperationResult {
+                    success: false,
+                    heading: "FIRMWARE IMPORT FAILED".to_owned(),
+                    message: format!("Firmware import failed safely: {error}"),
+                },
+            };
+            let _ = sender.send(result);
+        });
+    }
+
     fn start_firmware_download(&mut self, firmware: FirmwareFileStatus) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         let Some(download) = firmware.download.clone() else {
             self.status = "This firmware has no publisher download configured.".to_owned();
             return;
@@ -1052,12 +1982,34 @@ impl PortableApp {
                         report.bytes,
                         report.destination.display()
                     )),
+                    FirmwareInstallAction::Vita3k => {
+                        let status = LaunchPlan::for_current_vita3k_firmware_install(
+                            &layout,
+                            &report.destination,
+                        )
+                        .and_then(|plan| plan.spawn(&|_| {}))
+                        .and_then(|mut child| child.wait().map_err(Into::into))
+                        .map_err(|error| error.to_string())?;
+                        if !status.success() {
+                            return Err(format!("Vita3K's firmware installer exited with {status}"));
+                        }
+                        Ok(format!(
+                            "Downloaded and verified {} bytes from {}, and Vita3K installed it.",
+                            report.bytes, download.publisher
+                        ))
+                    }
                     FirmwareInstallAction::Rpcs3 => {
                         LaunchPlan::for_current_rpcs3_firmware_install(
                             &layout,
                             &report.destination,
                         )
-                        .and_then(|plan| plan.spawn().map(|_| ()))
+                        .and_then(|plan| plan.spawn(&|_| {}))
+                        .map(|mut child| {
+                            // Reap the installer when the user closes it.
+                            thread::spawn(move || {
+                                let _ = child.wait();
+                            });
+                        })
                         .map_err(|error| error.to_string())?;
                         Ok(format!(
                             "Downloaded and verified {} bytes from {}. RPCS3's firmware installer is open for confirmation.",
@@ -1085,14 +2037,16 @@ impl PortableApp {
         if self.readiness_refresh.is_some() {
             return;
         }
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
-        let entries = self.browse.entries.clone();
+        let layout = self.layout.clone();
+        let browse = Arc::clone(&self.browse);
+        let context = self.context.clone();
         let (sender, receiver) = mpsc::channel();
         self.readiness_refresh = Some(receiver);
         thread::spawn(move || {
             let result =
-                ReadinessReport::audit(&layout, &entries).map_err(|error| error.to_string());
+                ReadinessReport::audit(&layout, &browse.entries).map_err(|error| error.to_string());
             let _ = sender.send(result);
+            context.request_repaint();
         });
     }
 
@@ -1179,11 +2133,11 @@ impl PortableApp {
     }
 
     fn start_browse_download(&mut self, entry: BrowseEntry) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         let (sender, receiver) = mpsc::channel();
         self.operation = Some(receiver);
         self.status = format!(
-            "Downloading {} from its immutable source snapshot…",
+            "Downloading {} from its publisher and verifying it…",
             entry.title
         );
         thread::spawn(move || {
@@ -1200,9 +2154,9 @@ impl PortableApp {
                     success: true,
                     heading: "DOWNLOAD COMPLETE — PLAY IS READY".to_owned(),
                     message: format!(
-                        "Downloaded and imported {title}: {} file(s), {} MiB. PLAY is ready.",
+                        "Downloaded, verified, and installed {title}: {} file(s), {}. PLAY is ready.",
                         report.import.imported_files,
-                        report.import.imported_bytes / (1024 * 1024)
+                        format_import_size(report.import.imported_bytes)
                     ),
                 },
                 Err(error) => OperationResult {
@@ -1225,32 +2179,21 @@ impl PortableApp {
         });
         let mut import = None;
         let mut direct_download = None;
+        let mut folder_import = None;
         let mut close = false;
         let Some(dialog) = &mut self.firmware_dialog else {
             return;
         };
-        if let Some(path) = dropped
-            && path.is_file()
-        {
-            dialog.path_text = path.display().to_string();
-            dialog.selected = Some(path);
-            dialog.message = "Dropped file selected. Confirm the destination below.".to_owned();
+        if let Some(path) = dropped {
+            if path.is_file() {
+                dialog.browser.path_text = path.display().to_string();
+                dialog.browser.selected = Some(path);
+                dialog.message = "Dropped file selected. Confirm the destination below.".to_owned();
+            } else if path.is_dir() {
+                folder_import = Some(path);
+            }
         }
-        let directory_entries = std::fs::read_dir(&dialog.directory)
-            .map(|entries| {
-                let mut entries = entries
-                    .filter_map(Result::ok)
-                    .map(|entry| {
-                        let path = entry.path();
-                        (path.is_dir(), entry.file_name(), path)
-                    })
-                    .collect::<Vec<_>>();
-                entries.sort_by_cached_key(|(is_directory, name, _)| {
-                    (!*is_directory, name.to_string_lossy().to_ascii_lowercase())
-                });
-                entries
-            })
-            .unwrap_or_default();
+        let directory_entries = dialog.browser.entries();
 
         root.heading(format!("Firmware · {}", dialog.system.to_ascii_uppercase()));
         root.label(
@@ -1272,11 +2215,16 @@ impl PortableApp {
                 "REQUIRED"
             };
             let state = if firmware.present { "READY" } else { "MISSING" };
+            let alternatives = if firmware.alternatives.is_empty() {
+                String::new()
+            } else {
+                format!(" (or {})", firmware.alternatives.join(", "))
+            };
             if root
                 .selectable_label(
                     dialog.selected_firmware == index,
                     format!(
-                        "{kind} · bios/{}{} · {state}",
+                        "{kind} · bios/{}{}{alternatives} · {state}",
                         firmware.relative_path,
                         if firmware.directory { "/" } else { "" }
                     ),
@@ -1323,6 +2271,24 @@ impl PortableApp {
                     .color(egui::Color32::from_gray(130)),
             );
         });
+        if let Some(record) = dialog
+            .records
+            .get(dialog.selected_firmware)
+            .cloned()
+            .flatten()
+        {
+            root.label(
+                egui::RichText::new(format!(
+                    "Recorded: {} · {} · SHA-256 {}",
+                    record.origin,
+                    format_import_size(record.size),
+                    record.sha256
+                ))
+                .small()
+                .monospace()
+                .color(egui::Color32::from_gray(150)),
+            );
+        }
         root.add_space(6.0);
 
         if let Some(download) = &target.download {
@@ -1367,43 +2333,35 @@ impl PortableApp {
                 .clicked()
                 && let Some(home) = dirs::home_dir()
             {
-                dialog.directory = home;
-                dialog.path_text = dialog.directory.display().to_string();
-                dialog.selected = None;
+                dialog.browser.open(home);
             }
             if ui
                 .add(egui::Button::new("DOWNLOADS").fill(CONTROL_BACKGROUND))
                 .clicked()
                 && let Some(downloads) = dirs::download_dir()
             {
-                dialog.directory = downloads;
-                dialog.path_text = dialog.directory.display().to_string();
-                dialog.selected = None;
+                dialog.browser.open(downloads);
             }
             if ui
                 .add(egui::Button::new("UP").fill(CONTROL_BACKGROUND))
                 .clicked()
-                && let Some(parent) = dialog.directory.parent()
+                && let Some(parent) = dialog.browser.directory.parent()
             {
-                dialog.directory = parent.to_owned();
-                dialog.path_text = dialog.directory.display().to_string();
-                dialog.selected = None;
+                dialog.browser.open(parent.to_owned());
             }
             #[cfg(target_os = "linux")]
             if ui
                 .add(egui::Button::new("FILESYSTEM").fill(CONTROL_BACKGROUND))
                 .clicked()
             {
-                dialog.directory = PathBuf::from("/");
-                dialog.path_text = "/".to_owned();
-                dialog.selected = None;
+                dialog.browser.open(PathBuf::from("/"));
             }
         });
         root.horizontal(|ui| {
             let submitted = ui
                 .add_sized(
                     [(ui.available_width() - 52.0).max(180.0), 24.0],
-                    egui::TextEdit::singleline(&mut dialog.path_text)
+                    egui::TextEdit::singleline(&mut dialog.browser.path_text)
                         .background_color(INPUT_BACKGROUND),
                 )
                 .lost_focus()
@@ -1415,14 +2373,14 @@ impl PortableApp {
                 )
                 .clicked()
                 || submitted)
-                && !dialog.path_text.trim().is_empty()
+                && !dialog.browser.path_text.trim().is_empty()
             {
-                let path = PathBuf::from(dialog.path_text.trim());
+                let path = PathBuf::from(dialog.browser.path_text.trim());
                 if path.is_dir() {
-                    dialog.directory = path;
-                    dialog.selected = None;
+                    dialog.browser.directory = path;
+                    dialog.browser.selected = None;
                 } else if path.is_file() {
-                    dialog.selected = Some(path);
+                    dialog.browser.selected = Some(path);
                 } else {
                     dialog.message = "That path does not exist.".to_owned();
                 }
@@ -1436,19 +2394,17 @@ impl PortableApp {
             .show(root, |ui| {
                 for (is_directory, name, path) in &directory_entries {
                     let label = if *is_directory {
-                        format!("📁  {}", name.to_string_lossy())
+                        format!("📁  {name}")
                     } else {
-                        format!("      {}", name.to_string_lossy())
+                        format!("      {name}")
                     };
-                    let selected = dialog.selected.as_ref() == Some(path);
+                    let selected = dialog.browser.selected.as_ref() == Some(path);
                     if ui.selectable_label(selected, label).clicked() {
                         if *is_directory {
-                            dialog.directory = path.clone();
-                            dialog.path_text = path.display().to_string();
-                            dialog.selected = None;
+                            dialog.browser.open(path.clone());
                         } else {
-                            dialog.path_text = path.display().to_string();
-                            dialog.selected = Some(path.clone());
+                            dialog.browser.path_text = path.display().to_string();
+                            dialog.browser.selected = Some(path.clone());
                         }
                     }
                 }
@@ -1457,7 +2413,11 @@ impl PortableApp {
         root.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    dialog.selected.as_ref().is_some_and(|path| path.is_file())
+                    dialog
+                        .browser
+                        .selected
+                        .as_ref()
+                        .is_some_and(|path| path.is_file())
                         && self.operation.is_none(),
                     egui::Button::new(format!(
                         "{} {} bios/{}{}",
@@ -1469,9 +2429,23 @@ impl PortableApp {
                     .fill(CONTROL_BACKGROUND),
                 )
                 .clicked()
-                && let Some(source) = dialog.selected.clone()
+                && let Some(source) = dialog.browser.selected.clone()
             {
                 import = Some((target.clone(), source));
+            }
+            if ui
+                .add_enabled(
+                    self.operation.is_none(),
+                    egui::Button::new("RECOGNISE EVERY BIOS IN THIS FOLDER").fill(CONTROL_BACKGROUND),
+                )
+                .on_hover_text(
+                    "Searches this folder and its subfolders, identifies each BIOS or firmware file \
+                     by fingerprint for every system, and places it where its emulators look. \
+                     A different file already in place is kept.",
+                )
+                .clicked()
+            {
+                folder_import = Some(dialog.browser.directory.clone());
             }
             if ui
                 .add(egui::Button::new("CANCEL").fill(CONTROL_BACKGROUND))
@@ -1480,7 +2454,10 @@ impl PortableApp {
                 close = true;
             }
         });
-        if let Some(firmware) = direct_download {
+        if let Some(folder) = folder_import {
+            self.firmware_dialog = None;
+            self.start_firmware_folder_import(folder);
+        } else if let Some(firmware) = direct_download {
             self.firmware_dialog = None;
             self.start_firmware_download(firmware);
         } else if let Some((firmware, source)) = import {
@@ -1517,35 +2494,20 @@ impl PortableApp {
         if let Some(path) = dropped
             && (path.is_file() || path.is_dir())
         {
-            dialog.path_text = path.display().to_string();
+            dialog.browser.path_text = path.display().to_string();
             if path.is_dir() {
-                dialog.directory = path;
-                dialog.selected = None;
+                dialog.browser.directory = path;
+                dialog.browser.selected = None;
                 dialog.message =
                     "Dropped folder selected. Importing it preserves every required game file."
                         .to_owned();
             } else {
-                dialog.selected = Some(path);
+                dialog.browser.selected = Some(path);
                 dialog.message = "Dropped file selected. Confirm the import below.".to_owned();
             }
         }
 
-        let directory_entries = std::fs::read_dir(&dialog.directory)
-            .map(|entries| {
-                let mut entries: Vec<_> = entries
-                    .filter_map(Result::ok)
-                    .map(|entry| {
-                        let path = entry.path();
-                        let is_directory = path.is_dir();
-                        (is_directory, entry.file_name(), path)
-                    })
-                    .collect();
-                entries.sort_by_cached_key(|(is_directory, name, _)| {
-                    (!*is_directory, name.to_string_lossy().to_ascii_lowercase())
-                });
-                entries
-            })
-            .unwrap_or_default();
+        let directory_entries = dialog.browser.entries();
         root.heading(format!("Import {}", dialog.entry.title));
         root.label(
             egui::RichText::new(format!(
@@ -1601,10 +2563,10 @@ impl PortableApp {
                             .color(egui::Color32::from_rgb(98, 211, 145)),
                     );
                 }
-                BackendState::ProvisionOnFirstPlay => {
+                BackendState::EmulatorMissing => {
                     root.label(
                         egui::RichText::new(
-                            "EMULATOR SETUP ON FIRST PLAY · RetroBat may need an internet connection once.",
+                            "EMULATOR NOT INSTALLED · This installation has no emulator for this system yet.",
                         )
                         .small()
                         .strong()
@@ -1710,10 +2672,10 @@ impl PortableApp {
         }
         root.add_space(6.0);
 
-        let supports_folder = matches!(
-            dialog.entry.system.to_ascii_lowercase().as_str(),
-            "ps3" | "ps4" | "wiiu" | "windows"
-        );
+        // Any game that is a folder of files (PS3/PS4/Wii U dumps, PC games,
+        // PSP homebrew with its assets) imports as a whole. MAME is the
+        // exception: it plays the intact ROM-set ZIP.
+        let supports_folder = !dialog.entry.system.eq_ignore_ascii_case("mame");
         if dialog.entry.system.eq_ignore_ascii_case("mame") {
             root.label(
                 egui::RichText::new(
@@ -1726,51 +2688,43 @@ impl PortableApp {
         root.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    supports_folder && dialog.directory.is_dir() && self.operation.is_none(),
+                    supports_folder && dialog.browser.directory.is_dir() && self.operation.is_none(),
                     egui::Button::new("IMPORT THIS FOLDER").fill(CONTROL_BACKGROUND),
                 )
                 .on_hover_text(
-                    "Use for extracted PS3/PS4/Wii U games and PC games with DLLs or data folders.",
+                    "Imports the whole folder shown below: extracted PS3/PS4/Wii U games, PC games with their DLLs and data, homebrew with its assets.",
                 )
                 .clicked()
             {
-                import = Some((dialog.entry.clone(), dialog.directory.clone()));
+                import = Some((dialog.entry.clone(), dialog.browser.directory.clone()));
             }
             if ui
                 .add(egui::Button::new("HOME").fill(CONTROL_BACKGROUND))
                 .clicked()
                 && let Some(home) = dirs::home_dir()
             {
-                dialog.directory = home;
-                dialog.path_text = dialog.directory.display().to_string();
-                dialog.selected = None;
+                dialog.browser.open(home);
             }
             if ui
                 .add(egui::Button::new("DOWNLOADS").fill(CONTROL_BACKGROUND))
                 .clicked()
                 && let Some(downloads) = dirs::download_dir()
             {
-                dialog.directory = downloads;
-                dialog.path_text = dialog.directory.display().to_string();
-                dialog.selected = None;
+                dialog.browser.open(downloads);
             }
             if ui
                 .add(egui::Button::new("UP").fill(CONTROL_BACKGROUND))
                 .clicked()
-                && let Some(parent) = dialog.directory.parent()
+                && let Some(parent) = dialog.browser.directory.parent()
             {
-                dialog.directory = parent.to_owned();
-                dialog.path_text = dialog.directory.display().to_string();
-                dialog.selected = None;
+                dialog.browser.open(parent.to_owned());
             }
             #[cfg(target_os = "linux")]
             if ui
                 .add(egui::Button::new("FILESYSTEM").fill(CONTROL_BACKGROUND))
                 .clicked()
             {
-                dialog.directory = PathBuf::from("/");
-                dialog.path_text = "/".to_owned();
-                dialog.selected = None;
+                dialog.browser.open(PathBuf::from("/"));
             }
         });
 
@@ -1787,9 +2741,7 @@ impl PortableApp {
                         )
                         .clicked()
                 {
-                    dialog.directory = drive;
-                    dialog.path_text = dialog.directory.display().to_string();
-                    dialog.selected = None;
+                    dialog.browser.open(drive);
                 }
             }
         });
@@ -1801,7 +2753,7 @@ impl PortableApp {
             let submitted = ui
                 .add_sized(
                     [path_width, 24.0],
-                    egui::TextEdit::singleline(&mut dialog.path_text)
+                    egui::TextEdit::singleline(&mut dialog.browser.path_text)
                         .background_color(INPUT_BACKGROUND),
                 )
                 .lost_focus()
@@ -1813,14 +2765,14 @@ impl PortableApp {
                 )
                 .clicked()
                 || submitted)
-                && !dialog.path_text.trim().is_empty()
+                && !dialog.browser.path_text.trim().is_empty()
             {
-                let path = PathBuf::from(dialog.path_text.trim());
+                let path = PathBuf::from(dialog.browser.path_text.trim());
                 if path.is_dir() {
-                    dialog.directory = path;
-                    dialog.selected = None;
+                    dialog.browser.directory = path;
+                    dialog.browser.selected = None;
                 } else if path.is_file() {
-                    dialog.selected = Some(path);
+                    dialog.browser.selected = Some(path);
                 } else {
                     dialog.message = "That path does not exist.".to_owned();
                 }
@@ -1836,22 +2788,20 @@ impl PortableApp {
             .show(root, |ui| {
                 for (is_directory, name, path) in &directory_entries {
                     let label = if *is_directory {
-                        format!("📁  {}", name.to_string_lossy())
+                        format!("📁  {name}")
                     } else {
-                        format!("      {}", name.to_string_lossy())
+                        format!("      {name}")
                     };
-                    let selected = dialog.selected.as_ref() == Some(path);
+                    let selected = dialog.browser.selected.as_ref() == Some(path);
                     let response = ui.selectable_label(selected, label);
                     if response.double_clicked() && !*is_directory && self.operation.is_none() {
                         import = Some((dialog.entry.clone(), path.clone()));
                     } else if response.clicked() {
                         if *is_directory {
-                            dialog.directory = path.clone();
-                            dialog.path_text = path.display().to_string();
-                            dialog.selected = None;
+                            dialog.browser.open(path.clone());
                         } else {
-                            dialog.path_text = path.display().to_string();
-                            dialog.selected = Some(path.clone());
+                            dialog.browser.path_text = path.display().to_string();
+                            dialog.browser.selected = Some(path.clone());
                         }
                     }
                 }
@@ -1860,12 +2810,16 @@ impl PortableApp {
         root.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    dialog.selected.as_ref().is_some_and(|path| path.is_file())
+                    dialog
+                        .browser
+                        .selected
+                        .as_ref()
+                        .is_some_and(|path| path.is_file())
                         && self.operation.is_none(),
                     egui::Button::new("IMPORT AND PREPARE GAME").fill(ACCENT),
                 )
                 .clicked()
-                && let Some(path) = dialog.selected.clone()
+                && let Some(path) = dialog.browser.selected.clone()
             {
                 import = Some((dialog.entry.clone(), path));
             }
@@ -1887,12 +2841,39 @@ impl PortableApp {
     }
 
     fn launch_library(&mut self) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
-        self.status =
-            match LaunchPlan::for_current_host(&layout).and_then(|plan| plan.spawn().map(|_| ())) {
-                Ok(()) => "RetroBat launched with the refreshed game library.".to_owned(),
-                Err(error) => format!("Launch failed: {error}"),
-            };
+        let layout = self.layout.clone();
+        match LaunchPlan::for_current_host(&layout) {
+            Ok(plan) => {
+                self.status = "Opening RetroBat's library…".to_owned();
+                // RetroBat is a separate application; its process is reaped
+                // in the background so it never lingers as a zombie.
+                let context = self.context.clone();
+                let (sender, receiver) = mpsc::channel();
+                self.operation = Some(receiver);
+                thread::spawn(move || {
+                    let result = plan.spawn(&|_| {}).map(|mut child| {
+                        thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                    });
+                    let _ = sender.send(match result {
+                        Ok(()) => OperationResult {
+                            success: true,
+                            heading: "RETROBAT LIBRARY OPEN".to_owned(),
+                            message: "RetroBat launched with the refreshed game library."
+                                .to_owned(),
+                        },
+                        Err(error) => OperationResult {
+                            success: false,
+                            heading: "RETROBAT DID NOT START".to_owned(),
+                            message: format!("RetroBat could not be launched: {error}"),
+                        },
+                    });
+                    context.request_repaint();
+                });
+            }
+            Err(error) => self.status = format!("Launch failed: {error}"),
+        }
     }
 
     fn launch_game(&mut self, catalog_id: &str, title: &str, system: &str, rom: &std::path::Path) {
@@ -1901,15 +2882,20 @@ impl PortableApp {
                 .to_owned();
             return;
         }
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
+        let preferred_core = self
+            .imported_manifests
+            .get(catalog_id)
+            .and_then(|manifest| manifest.core.clone());
         let backend = self
             .readiness
             .as_ref()
-            .and_then(|report| report.select_backend(system, rom))
+            .and_then(|report| {
+                report.select_backend_preferring(system, rom, preferred_core.as_deref())
+            })
             .cloned();
         let route_label = backend.as_ref().map(|route| route.label());
-        self.status = format!("Loading {title}…");
-        let plan =
+        let mut plan =
             match LaunchPlan::for_current_game_with_backend(&layout, system, rom, backend.as_ref())
             {
                 Ok(plan) => plan,
@@ -1918,77 +2904,28 @@ impl PortableApp {
                     return;
                 }
             };
-        let controller_guard = match ControllerMouseGuard::acquire_if_available() {
-            Ok(guard) => guard,
-            Err(error) => {
-                self.status = format!(
-                    "Could not suspend the desktop controller-to-mouse mapping; {title} was not launched: {error}"
-                );
-                return;
-            }
-        };
-        match plan.spawn() {
-            Ok(mut child) => {
-                let process_id = child.id();
-                let (exit_sender, exit_receiver) = mpsc::channel();
-                let context = self.context.clone();
-                let game_title = title.to_owned();
-                thread::spawn(move || {
-                    let result = child.wait();
-                    while process_tree_is_running(process_id) {
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    let guard_result = controller_guard
-                        .map(ControllerMouseGuard::release)
-                        .transpose();
-                    let mut message = match result {
-                        Ok(status) => format!("{game_title} closed ({status})."),
-                        Err(error) => format!("Could not monitor {game_title}: {error}"),
-                    };
-                    if let Err(error) = guard_result {
-                        message.push_str(&format!(
-                            " The desktop controller-to-mouse mapping could not be restored: {error}"
-                        ));
-                    }
-                    let _ = exit_sender.send(message);
-                    context.request_repaint();
-                });
-                self.running_game = Some(RunningGame {
-                    catalog_id: catalog_id.to_owned(),
-                    title: title.to_owned(),
-                    process_id,
-                    exit_receiver,
-                    launched_at: Instant::now(),
-                    termination_requested_at: None,
-                });
-                self.status = route_label.map_or_else(
-                    || format!("Loading {title}; its configured backend is starting…"),
-                    |route| format!("Loading {title} through the installed {route} backend…"),
-                );
-            }
-            Err(error) => {
-                drop(controller_guard);
-                self.status = format!("Could not launch {title}: {error}");
-            }
+        if self.gameplay_probe.is_some() {
+            plan.enable_retroarch_commands(PROBE_RETROARCH_COMMAND_PORT);
         }
+        let context = self.context.clone();
+        self.running_game = Some(GameSession::start(plan, catalog_id, title, move || {
+            context.request_repaint()
+        }));
+        self.status = route_label.map_or_else(
+            || format!("Loading {title}; its configured backend is starting…"),
+            |route| format!("Loading {title} through the installed {route} backend…"),
+        );
     }
 
     fn terminate_running_game(&mut self) {
         let Some(game) = &mut self.running_game else {
             return;
         };
-        if game.termination_requested_at.is_some() {
+        if game.phase() == SessionPhase::Terminating {
             return;
         }
-        match terminate_process_tree_id(game.process_id, false) {
-            Ok(()) => {
-                game.termination_requested_at = Some(Instant::now());
-                self.status = format!("Terminating {} and its emulator process tree…", game.title);
-            }
-            Err(error) => {
-                self.status = format!("Could not terminate {}: {error}", game.title);
-            }
-        }
+        game.terminate();
+        self.status = format!("Terminating {} and its emulator process tree…", game.title);
     }
 }
 
@@ -2012,8 +2949,8 @@ impl eframe::App for PortableApp {
             self.readiness = loaded.readiness;
             self.featured_ids = loaded.featured_ids;
             self.search_documents = loaded.search_documents;
-            self.imported_ids = loaded.imported_ids;
             self.imported_manifests = loaded.imported_manifests;
+            self.installed_ids = loaded.installed_ids;
             self.controls = Some(loaded.controls);
             self.browse_view_key = None;
             self.browse_systems.clear();
@@ -2052,32 +2989,32 @@ impl eframe::App for PortableApp {
                 probe.started = true;
             }
             if let Some((entry, manifest)) = launch {
-                let rom = PortableLayout::new(PathBuf::from(&self.root_text))
+                let rom = self
+                    .layout
+                    .clone()
                     .root
                     .join(&manifest.launch_relative_path);
                 self.launch_game(&entry.id, &entry.title, &manifest.system, &rom);
                 if self.running_game.is_some() {
-                    let (sender, receiver) = mpsc::channel();
-                    let (duration, repaint) = self
-                        .gameplay_probe
-                        .as_ref()
-                        .map(|probe| (probe.config.duration, self.context.clone()))
-                        .expect("gameplay probe exists");
-                    thread::spawn(move || {
-                        thread::sleep(duration);
-                        let _ = sender.send(());
-                        repaint.request_repaint();
-                    });
-                    if let Some(probe) = &mut self.gameplay_probe {
-                        probe.deadline_receiver = Some(receiver);
-                        let _ = probe.record("game_launched");
+                    if let Some(probe) = &self.gameplay_probe {
+                        let _ = probe.record(
+                            "launch_requested",
+                            serde_json::json!({
+                                "system": manifest.system,
+                                "launch_file": rom.display().to_string(),
+                                "status": self.status,
+                            }),
+                        );
                     }
                 } else if let Some(probe) = &self.gameplay_probe {
-                    let _ = probe.record("launch_failed");
+                    probe.fail(
+                        "launch_failed",
+                        serde_json::json!({ "status": self.status }),
+                    );
                     context.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             } else if let Some(probe) = &self.gameplay_probe {
-                let _ = probe.record("imported_game_not_found");
+                probe.fail("imported_game_not_found", serde_json::json!({}));
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
@@ -2089,9 +3026,9 @@ impl eframe::App for PortableApp {
             self.status = result.message.clone();
             self.operation_notice = Some(result);
             self.operation = None;
-            self.imported_manifests =
-                load_imported_manifests(&PortableLayout::new(PathBuf::from(&self.root_text)));
-            self.imported_ids = self.imported_manifests.keys().cloned().collect();
+            self.imported_manifests = imported_manifests(&self.layout);
+            self.installed_ids = installed_trusted_ids(&self.layout, &self.catalog);
+            self.retrobat_present = self.layout.retrobat_executable().is_file();
             self.browse_view_key = None;
             self.refresh_readiness();
         }
@@ -2113,12 +3050,69 @@ impl eframe::App for PortableApp {
         } else if self.readiness_refresh.is_some() {
             context.request_repaint_after(Duration::from_millis(100));
         }
-        if let Some(game) = &mut self.running_game
-            && game
-                .termination_requested_at
-                .is_some_and(|started| started.elapsed() >= Duration::from_secs(2))
-        {
-            let _ = terminate_process_tree_id(game.process_id, true);
+        let session_events = self
+            .running_game
+            .as_mut()
+            .map(GameSession::poll)
+            .unwrap_or_default();
+        for event in session_events {
+            match event {
+                SessionEvent::Phase(phase) => {
+                    if let Some(probe) = &self.gameplay_probe {
+                        let _ = probe.record("phase", serde_json::json!({ "phase": phase }));
+                    }
+                    self.status = phase;
+                }
+                SessionEvent::Started { process_id } => {
+                    if let Some(probe) = &mut self.gameplay_probe {
+                        // The measured window starts with the backend itself,
+                        // not with first-time preparation such as Wine setup.
+                        let (sender, receiver) = mpsc::channel();
+                        let duration = probe.config.duration;
+                        let repaint = self.context.clone();
+                        thread::spawn(move || {
+                            thread::sleep(duration);
+                            let _ = sender.send(());
+                            repaint.request_repaint();
+                        });
+                        probe.deadline_receiver = Some(receiver);
+                        let _ = probe.record(
+                            "game_started",
+                            serde_json::json!({ "process_id": process_id }),
+                        );
+                    }
+                }
+                SessionEvent::Exited { message, failed } => {
+                    let finished = self.running_game.take();
+                    if let (Some(probe), Some(game)) = (&mut self.gameplay_probe, finished)
+                        && probe.started
+                        && !probe.complete_recorded
+                    {
+                        let evidence = game.log_file.as_deref().map(backend_log_evidence);
+                        let tree_running = game.tree_is_running();
+                        let detail = serde_json::json!({
+                            "status": message,
+                            "failed": failed,
+                            "process_tree_running": tree_running,
+                            "backend_log": evidence,
+                        });
+                        if !probe.terminating {
+                            probe.fail("exited_before_deadline", detail);
+                        } else if tree_running {
+                            probe.fail("process_tree_survived_termination", detail);
+                        } else if evidence
+                            .as_ref()
+                            .is_some_and(|evidence| !evidence.content_loaded)
+                        {
+                            probe.fail("backend_did_not_load_content", detail);
+                        } else {
+                            let _ = probe.record("terminated", detail);
+                        }
+                        probe.terminating = true;
+                    }
+                    self.status = message;
+                }
+            }
         }
         let gameplay_probe_deadline = self
             .gameplay_probe
@@ -2126,31 +3120,71 @@ impl eframe::App for PortableApp {
             .and_then(|probe| probe.deadline_receiver.as_ref())
             .is_some_and(|receiver| receiver.try_recv().is_ok());
         if gameplay_probe_deadline {
+            let alive = self.running_game.as_ref().map(GameSession::tree_is_running);
+            let retroarch = self
+                .running_game
+                .as_ref()
+                .is_some_and(|game| game.log_file.is_some());
+            let screenshots = self.layout.clone().retrobat_root().join("screenshots");
+            let mut terminate_now = true;
             if let Some(probe) = &mut self.gameplay_probe {
                 probe.deadline_receiver = None;
+                match alive {
+                    Some(true) => {
+                        let _ = probe.record("alive_at_deadline", serde_json::json!({}));
+                        if retroarch {
+                            let (sender, receiver) = mpsc::channel();
+                            let repaint = self.context.clone();
+                            thread::spawn(move || {
+                                let _ = sender.send(capture_retroarch_screenshot(screenshots));
+                                repaint.request_repaint();
+                            });
+                            probe.screenshot_receiver = Some(receiver);
+                            terminate_now = false;
+                        }
+                    }
+                    _ => probe.fail(
+                        "not_running_at_deadline",
+                        serde_json::json!({ "status": self.status }),
+                    ),
+                }
+                probe.terminating = terminate_now;
+            }
+            if terminate_now {
+                self.terminate_running_game();
+            }
+        }
+        let screenshot = self
+            .gameplay_probe
+            .as_ref()
+            .and_then(|probe| probe.screenshot_receiver.as_ref())
+            .and_then(|receiver| receiver.try_recv().ok());
+        if let Some(screenshot) = screenshot {
+            if let Some(probe) = &mut self.gameplay_probe {
+                probe.screenshot_receiver = None;
                 probe.terminating = true;
-                let _ = probe.record("deadline_reached");
+                if screenshot.get("path").is_some() && screenshot.get("error").is_none() {
+                    let _ = probe.record("screenshot", screenshot);
+                } else {
+                    probe.fail("screenshot_failed", screenshot);
+                }
             }
             self.terminate_running_game();
-        }
-        let game_finished = self
-            .running_game
+        } else if self
+            .gameplay_probe
             .as_ref()
-            .and_then(|game| game.exit_receiver.try_recv().ok());
-        if let Some(status) = game_finished {
-            self.running_game = None;
-            self.status = status;
-        } else if let Some(game) = &self.running_game {
+            .is_some_and(|probe| probe.screenshot_receiver.is_some())
+        {
+            context.request_repaint_after(Duration::from_millis(100));
+        }
+        if let Some(game) = &self.running_game {
             // Do not continuously render the frontend while a fullscreen game
             // covers it. On native Wayland, presenting an occluded GL surface
             // can wait on compositor/GPU frame availability long enough to
-            // prevent winit from answering xdg_wm_base pings. The process
-            // watcher requests a repaint on exit; only the short loading and
-            // forced-termination transitions need timers here.
-            if let Some(delay) = active_game_repaint_delay(
-                game.launched_at.elapsed(),
-                game.termination_requested_at.is_some(),
-            ) {
+            // prevent winit from answering xdg_wm_base pings. The session
+            // requests a repaint for every event; only the loading,
+            // preparation, and forced-termination transitions need timers.
+            if let Some(delay) = active_game_repaint_delay(game.age(), game.phase()) {
                 context.request_repaint_after(delay);
             }
         }
@@ -2161,7 +3195,12 @@ impl eframe::App for PortableApp {
             && self.running_game.is_none()
         {
             if let Some(probe) = &mut self.gameplay_probe {
-                let _ = probe.record("gameplay_probe_complete");
+                let outcome = if GAMEPLAY_PROBE_FAILED.load(Ordering::SeqCst) {
+                    "gameplay_probe_failed"
+                } else {
+                    "gameplay_probe_complete"
+                };
+                let _ = probe.record(outcome, serde_json::json!({}));
                 probe.complete_recorded = true;
             }
             context.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2176,7 +3215,7 @@ impl eframe::App for PortableApp {
             self.artwork_pending = self.artwork_pending.saturating_sub(1);
             self.artwork_inflight.remove(&message.entry_id);
             match message.result {
-                Ok(decoded) => {
+                ArtworkResult::Decoded(decoded) => {
                     let color_image =
                         egui::ColorImage::from_rgba_unmultiplied(decoded.size, &decoded.rgba);
                     let texture = context.load_texture(
@@ -2184,11 +3223,13 @@ impl eframe::App for PortableApp {
                         color_image,
                         egui::TextureOptions::LINEAR,
                     );
-                    self.textures.insert(message.entry_id, texture);
+                    self.textures
+                        .insert(message.entry_id, (texture, self.frame_number));
                 }
-                Err(error) => {
+                ArtworkResult::Failed(error) => {
                     self.artwork_errors.insert(message.entry_id, error);
                 }
+                ArtworkResult::Skipped => {}
             }
             context.request_repaint();
         }
@@ -2215,7 +3256,6 @@ impl eframe::App for PortableApp {
     }
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        const CARD: egui::Color32 = egui::Color32::from_rgb(22, 27, 38);
         let panel = egui::Frame::new()
             .fill(egui::Color32::from_rgb(13, 16, 23))
             .inner_margin(24);
@@ -2260,7 +3300,7 @@ impl eframe::App for PortableApp {
                         .color(ACCENT),
                 );
                 ui.label(
-                    egui::RichText::new("// PORTABLE")
+                    egui::RichText::new("PORT")
                         .size(28.0)
                         .strong()
                         .color(egui::Color32::WHITE),
@@ -2268,14 +3308,13 @@ impl eframe::App for PortableApp {
             });
             ui.label(
                 egui::RichText::new(
-                    "One visual library for direct downloads and locally imported classics.",
+                    "One visual library for verified downloads and your own imported games.",
                 )
                     .size(15.0)
                     .color(egui::Color32::from_gray(165)),
             );
             ui.horizontal(|ui| {
-                let layout = PortableLayout::new(PathBuf::from(&self.root_text));
-                let can_launch = layout.retrobat_executable().is_file();
+                let can_launch = self.retrobat_present;
                 if ui
                     .add_enabled(
                         can_launch && self.operation.is_none(),
@@ -2315,11 +3354,11 @@ impl eframe::App for PortableApp {
                         );
                         ui.label(
                             egui::RichText::new(format!(
-                                "{} TITLES  ·  {} SOURCES  ·  {} VERIFIED INSTALL{}",
+                                "{} TITLES  ·  {} SOURCES  ·  {} VERIFIED DOWNLOADS",
                                 self.browse.entries.len(),
                                 self.browse.sources.len(),
-                                self.catalog.entries.len(),
-                                if self.catalog.entries.len() == 1 { "" } else { "S" }
+                                retrobat_portable::browse_install::ledger()
+                                    .map_or(0, |ledger| ledger.entries.len())
                             ))
                             .small()
                             .color(egui::Color32::from_gray(145)),
@@ -2434,621 +3473,46 @@ impl eframe::App for PortableApp {
                     let match_count = self.browse_matches.len();
                     self.browse_page = self.browse_page.min(page_count - 1);
                     let page_start = self.browse_page * BROWSE_PAGE_SIZE;
-                    let page_entries: Vec<BrowseEntry> = self
+                    let page: Vec<usize> = self
                         .browse_matches
                         .iter()
                         .copied()
                         .skip(page_start)
                         .take(BROWSE_PAGE_SIZE)
-                        .map(|index| self.browse.entries[index].clone())
                         .collect();
-                    let mut artwork_requests = Vec::new();
-                    let mut requested_import = None;
-                    let mut requested_install = None;
-                    let mut requested_download = None;
-                    let mut requested_firmware = None;
-                    let mut requested_controls = None;
-                    let mut requested_remove_import = None;
-                    let mut requested_play: Option<(String, String, String, PathBuf)> = None;
-                    let mut requested_terminate = false;
-                    let layout = PortableLayout::new(PathBuf::from(&self.root_text));
-
+                    if self.browse_page_key != Some((self.browse_view_key.clone(), self.browse_page)) {
+                        // A new page makes queued artwork for the old one stale.
+                        self.browse_page_key = Some((self.browse_view_key.clone(), self.browse_page));
+                        self.artwork_generation.fetch_add(1, Ordering::SeqCst);
+                    }
                     let (grid_columns, card_width, grid_spacing) =
                         browse_grid_geometry(library_viewport_width);
                     let artwork_height = (card_width * 2.0 / 3.0).round();
+                    let mut actions = Vec::new();
+                    let mut artwork_requests = Vec::new();
+                    self.frame_number += 1;
                     egui::Grid::new("browse-card-grid")
                         .num_columns(grid_columns)
                         .spacing([grid_spacing, grid_spacing])
                         .show(ui, |ui| {
-                                for (card_index, entry) in page_entries.iter().enumerate() {
-                                    egui::Frame::new()
-                                        .fill(CARD)
-                                        .stroke(egui::Stroke::new(
-                                            1.0,
-                                            egui::Color32::from_rgb(43, 51, 69),
-                                        ))
-                                        .corner_radius(10)
-                                        .inner_margin(10)
-                                        .show(ui, |ui| {
-                                            ui.vertical(|ui| {
-                                                ui.set_min_width(card_width);
-                                                ui.set_max_width(card_width);
-                                                if let Some(texture) = self.textures.get(&entry.id)
-                                                {
-                                                    ui.add(
-                                                        egui::Image::new((
-                                                            texture.id(),
-                                                            egui::vec2(card_width, artwork_height),
-                                                        ))
-                                                        .fit_to_exact_size(egui::vec2(
-                                                            card_width,
-                                                            artwork_height,
-                                                        ))
-                                                        .corner_radius(7),
-                                                    );
-                                                } else {
-                                                    let (rect, _) = ui.allocate_exact_size(
-                                                        egui::vec2(card_width, artwork_height),
-                                                        egui::Sense::hover(),
-                                                    );
-                                                    let has_sourced_artwork = entry
-                                                        .artwork_asset
-                                                        .is_some()
-                                                        || entry.artwork_url.is_some();
-                                                    let failed = self
-                                                        .artwork_errors
-                                                        .contains_key(&entry.id);
-                                                    if has_sourced_artwork && !failed {
-                                                        ui.painter().rect_filled(
-                                                            rect,
-                                                            7,
-                                                            egui::Color32::from_rgb(28, 35, 49),
-                                                        );
-                                                        ui.painter().text(
-                                                            rect.center(),
-                                                            egui::Align2::CENTER_CENTER,
-                                                            "LOADING…",
-                                                            egui::FontId::proportional(12.0),
-                                                            egui::Color32::from_gray(130),
-                                                        );
-                                                    } else {
-                                                        paint_generated_artwork(
-                                                            ui.painter(),
-                                                            rect,
-                                                            entry,
-                                                        );
-                                                    }
-                                                    if has_sourced_artwork
-                                                        && !self
-                                                            .artwork_inflight
-                                                            .contains(&entry.id)
-                                                        && !failed
-                                                    {
-                                                        let source = self
-                                                            .catalog
-                                                            .entries
-                                                            .iter()
-                                                            .find(|trusted| trusted.id == entry.id)
-                                                            .and_then(|trusted| {
-                                                                trusted.artwork.first().cloned()
-                                                            })
-                                                            .map(ArtworkSource::Verified)
-                                                            .or_else(|| {
-                                                                entry
-                                                                    .artwork_asset
-                                                                    .clone()
-                                                                    .map(ArtworkSource::Bundled)
-                                                            })
-                                                            .or_else(|| {
-                                                                entry
-                                                                    .artwork_url
-                                                                    .clone()
-                                                                    .map(ArtworkSource::Snapshot)
-                                                            })
-                                                            .expect(
-                                                                "sourced artwork has a loader",
-                                                            );
-                                                        artwork_requests.push((
-                                                            entry.id.clone(),
-                                                            source,
-                                                        ));
-                                                    }
-                                                }
-                                                ui.add_space(5.0);
-                                                ui.label(
-                                                    egui::RichText::new(&entry.title)
-                                                        .strong()
-                                                        .color(egui::Color32::WHITE),
-                                                );
-                                                let source_name = self
-                                                    .browse
-                                                    .sources
-                                                    .iter()
-                                                    .find(|source| source.id == entry.source_id)
-                                                    .map(|source| source.name.as_str())
-                                                    .unwrap_or(&entry.source_id);
-                                                ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "{}  ·  {}{}",
-                                                        entry.system.to_ascii_uppercase(),
-                                                        source_name,
-                                                        entry
-                                                            .release_year
-                                                            .map(|year| format!("  ·  {year}"))
-                                                            .unwrap_or_default()
-                                                    ))
-                                                    .small()
-                                                    .color(egui::Color32::from_gray(145)),
-                                                );
-                                                ui.label(
-                                                    egui::RichText::new(&entry.developer)
-                                                        .small()
-                                                        .color(egui::Color32::from_gray(165)),
-                                                );
-                                                if let Some(license) = &entry.license {
-                                                    ui.label(
-                                                        egui::RichText::new(license)
-                                                            .small()
-                                                            .color(egui::Color32::from_gray(125)),
-                                                    );
-                                                }
-                                                let (trust, trust_color) = match (
-                                                    entry.acquisition,
-                                                    entry.install_state,
-                                                ) {
-                                                    (
-                                                        Acquisition::DirectDownload,
-                                                        InstallState::Verified,
-                                                    ) => (
-                                                        "VERIFIED DOWNLOAD",
-                                                        egui::Color32::from_rgb(98, 211, 145),
-                                                    ),
-                                                    (
-                                                        Acquisition::DirectDownload,
-                                                        InstallState::AuditRequired,
-                                                    ) => (
-                                                        "DIRECT DOWNLOAD",
-                                                        egui::Color32::from_rgb(238, 177, 89),
-                                                    ),
-                                                    (Acquisition::DirectDownload, _) => (
-                                                        "DIRECT DOWNLOAD",
-                                                        egui::Color32::from_gray(145),
-                                                    ),
-                                                    (Acquisition::LocalImport, _) => (
-                                                        "LOCAL COPY REQUIRED",
-                                                        egui::Color32::from_gray(145),
-                                                    ),
-                                                };
-                                                ui.label(
-                                                    egui::RichText::new(trust)
-                                                        .small()
-                                                        .strong()
-                                                        .color(trust_color),
-                                                );
-                                                if let Some(readiness) = self
-                                                    .readiness
-                                                    .as_ref()
-                                                    .and_then(|report| {
-                                                        report.for_catalog_system(&entry.system)
-                                                    })
-                                                {
-                                                    let (label, color, detail) = match readiness
-                                                        .backend
-                                                    {
-                                                        BackendState::ReadyNow => (
-                                                            "BACKEND READY",
-                                                            egui::Color32::from_rgb(98, 211, 145),
-                                                            readiness
-                                                                .ready_route
-                                                                .as_ref()
-                                                                .map(|route| {
-                                                                    format!(
-                                                                        "Installed route: {}",
-                                                                        route.label()
-                                                                    )
-                                                                })
-                                                                .unwrap_or_else(|| {
-                                                                    "An installed emulator route is available."
-                                                                        .to_owned()
-                                                                }),
-                                                        ),
-                                                        BackendState::ProvisionOnFirstPlay => (
-                                                            "EMULATOR SETUP ON FIRST PLAY",
-                                                            egui::Color32::from_rgb(238, 177, 89),
-                                                            "RetroBat has a system adapter but no configured backend is installed yet. It may download one on first play."
-                                                                .to_owned(),
-                                                        ),
-                                                        BackendState::Unresolved => (
-                                                            "BACKEND NOT YET RESOLVED",
-                                                            egui::Color32::from_rgb(235, 113, 113),
-                                                            "No RetroBat system adapter is currently mapped for this catalogue system."
-                                                                .to_owned(),
-                                                        ),
-                                                    };
-                                                    ui.label(
-                                                        egui::RichText::new(label)
-                                                            .small()
-                                                            .strong()
-                                                            .color(color),
-                                                    )
-                                                    .on_hover_text(detail);
-                                                    if readiness.firmware
-                                                        == FirmwareState::RequiredMissing
-                                                    {
-                                                        ui.label(
-                                                            egui::RichText::new(
-                                                                "FIRMWARE SETUP REQUIRED",
-                                                            )
-                                                            .small()
-                                                            .color(egui::Color32::from_rgb(
-                                                                238, 177, 89,
-                                                            )),
-                                                        )
-                                                        .on_hover_text(format!(
-                                                            "The selected installed backend declares {} required firmware file(s); none were detected.",
-                                                            readiness.firmware_candidates
-                                                        ));
-                                                    }
-                                                    let missing_required = readiness
-                                                        .firmware_files
-                                                        .iter()
-                                                        .any(|file| {
-                                                            !file.present && !file.optional
-                                                        });
-                                                    let missing_optional = readiness
-                                                        .firmware_files
-                                                        .iter()
-                                                        .any(|file| file.optional && !file.present);
-                                                    let downloadable_required = readiness
-                                                        .firmware_files
-                                                        .iter()
-                                                        .any(|file| {
-                                                            !file.present
-                                                                && !file.optional
-                                                                && file.download.is_some()
-                                                        });
-                                                    let downloadable_optional = readiness
-                                                        .firmware_files
-                                                        .iter()
-                                                        .any(|file| {
-                                                            !file.present
-                                                                && file.optional
-                                                                && file.download.is_some()
-                                                        });
-                                                    if !readiness.firmware_files.is_empty()
-                                                        && ui
-                                                            .add_enabled(
-                                                                self.operation.is_none(),
-                                                                egui::Button::new(
-                                                                    egui::RichText::new(
-                                                                        if missing_required {
-                                                                            if downloadable_required {
-                                                                                "INSTALL FIRMWARE"
-                                                                            } else {
-                                                                                "IMPORT FIRMWARE"
-                                                                            }
-                                                                        } else if missing_optional {
-                                                                            if downloadable_optional {
-                                                                                "INSTALL OPTIONAL FIRMWARE"
-                                                                            } else {
-                                                                                "IMPORT OPTIONAL FIRMWARE"
-                                                                            }
-                                                                        } else {
-                                                                            "MANAGE FIRMWARE"
-                                                                        },
-                                                                    )
-                                                                    .small()
-                                                                    .strong(),
-                                                                )
-                                                                .fill(CONTROL_BACKGROUND),
-                                                            )
-                                                            .clicked()
-                                                    {
-                                                        requested_firmware =
-                                                            Some(readiness.clone());
-                                                    }
-                                                }
-                                                if let Some(url) = &entry.detail_url {
-                                                    ui.hyperlink_to(
-                                                        egui::RichText::new("SOURCE DETAILS")
-                                                            .small()
-                                                            .color(ACCENT),
-                                                        url,
-                                                    );
-                                                }
-                                                ui.add_space(4.0);
-                                                if ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            egui::RichText::new("⌨  CONTROLS")
-                                                                .small()
-                                                                .strong(),
-                                                        )
-                                                        .fill(CONTROL_BACKGROUND)
-                                                        .min_size(egui::vec2(122.0, 26.0)),
-                                                    )
-                                                    .on_hover_text(
-                                                        "Available before import: guidance comes from the catalogue's MAME/RetroBat metadata and the installed RetroArch/controller configuration, not from inspecting ROM bytes.",
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    requested_controls = Some(entry.clone());
-                                                }
-                                                ui.add_space(3.0);
-                                                match entry.acquisition {
-                                                    Acquisition::LocalImport => {
-                                                        let imported = self
-                                                            .imported_manifests
-                                                            .get(&entry.id)
-                                                            .cloned();
-                                                        let imported_ready = imported.is_some();
-                                                        let (label, game_intent) = if imported
-                                                            .is_some()
-                                                        {
-                                                            game_button_state(
-                                                                self.running_game.as_ref().map(
-                                                                    |game| {
-                                                                        (
-                                                                            game.catalog_id
-                                                                                .as_str(),
-                                                                            game.launched_at
-                                                                                .elapsed(),
-                                                                            game.termination_requested_at
-                                                                                .is_some(),
-                                                                        )
-                                                                    },
-                                                                ),
-                                                                &entry.id,
-                                                            )
-                                                        } else {
-                                                            (
-                                                                "IMPORT GAME".to_owned(),
-                                                                GameButtonIntent::Play,
-                                                            )
-                                                        };
-                                                        if ui
-                                                            .add_enabled(
-                                                                self.operation.is_none()
-                                                                    && game_intent
-                                                                        != GameButtonIntent::Disabled,
-                                                                egui::Button::new(
-                                                                    egui::RichText::new(&label)
-                                                                        .small()
-                                                                        .strong()
-                                                                        .color(
-                                                                            egui::Color32::WHITE,
-                                                                        ),
-                                                                )
-                                                                .fill(ACCENT)
-                                                                .min_size(egui::vec2(122.0, 28.0)),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            if game_intent
-                                                                == GameButtonIntent::Terminate
-                                                            {
-                                                                requested_terminate = true;
-                                                            } else if let Some(manifest) = imported.clone() {
-                                                                requested_play = Some((
-                                                                    entry.id.clone(),
-                                                                    entry.title.clone(),
-                                                                    manifest.system,
-                                                                    layout.root.join(
-                                                                        manifest
-                                                                            .launch_relative_path,
-                                                                    ),
-                                                                ));
-                                                            } else {
-                                                                requested_import =
-                                                                    Some(entry.clone());
-                                                            }
-                                                        }
-                                                        if imported_ready
-                                                            && ui
-                                                                .add_enabled(
-                                                                    remove_import_available(
-                                                                        imported_ready,
-                                                                        self.operation.is_some(),
-                                                                        self.running_game.is_some(),
-                                                                    ),
-                                                                    egui::Button::new(
-                                                                        egui::RichText::new(
-                                                                            "REMOVE",
-                                                                        )
-                                                                        .small()
-                                                                        .strong(),
-                                                                    )
-                                                                    .fill(egui::Color32::from_rgb(
-                                                                        113, 47, 55,
-                                                                    ))
-                                                                    .min_size(egui::vec2(
-                                                                        122.0, 26.0,
-                                                                    )),
-                                                                )
-                                                                .on_hover_text(
-                                                                    "Remove files owned by this import and return the card to IMPORT GAME. Modified files are preserved.",
-                                                                )
-                                                                .clicked()
-                                                        {
-                                                            requested_remove_import = Some((
-                                                                entry.id.clone(),
-                                                                entry.title.clone(),
-                                                            ));
-                                                        }
-                                                    }
-                                                    Acquisition::DirectDownload => {
-                                                        let trusted = self
-                                                            .catalog
-                                                            .entries
-                                                            .iter()
-                                                            .find(|trusted| {
-                                                                trusted.id == entry.id
-                                                            });
-                                                        let installed = trusted.is_some_and(
-                                                            |trusted| {
-                                                                is_installed(&layout, trusted)
-                                                            },
-                                                        );
-                                                        let imported = self
-                                                            .imported_manifests
-                                                            .get(&entry.id)
-                                                            .cloned();
-                                                        let imported_ready = imported.is_some();
-                                                        let game_ready = installed
-                                                            || imported.is_some();
-                                                        let (label, game_intent) = if game_ready {
-                                                            game_button_state(
-                                                                self.running_game.as_ref().map(
-                                                                    |game| {
-                                                                        (
-                                                                            game.catalog_id
-                                                                                .as_str(),
-                                                                            game.launched_at
-                                                                                .elapsed(),
-                                                                            game.termination_requested_at
-                                                                                .is_some(),
-                                                                        )
-                                                                    },
-                                                                ),
-                                                                &entry.id,
-                                                            )
-                                                        } else {
-                                                            (
-                                                                "DOWNLOAD".to_owned(),
-                                                                GameButtonIntent::Play,
-                                                            )
-                                                        };
-                                                        if ui
-                                                            .add_enabled(
-                                                                self.operation.is_none()
-                                                                    && game_intent
-                                                                        != GameButtonIntent::Disabled
-                                                                    && (installed
-                                                                        || imported.is_some()
-                                                                        || trusted.is_some()
-                                                                        || supports_direct_download(
-                                                                            entry,
-                                                                        )),
-                                                                egui::Button::new(
-                                                                    egui::RichText::new(&label)
-                                                                        .small()
-                                                                        .strong()
-                                                                        .color(
-                                                                            egui::Color32::WHITE,
-                                                                        ),
-                                                                )
-                                                                .fill(ACCENT)
-                                                                .min_size(egui::vec2(150.0, 28.0)),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            if game_intent
-                                                                == GameButtonIntent::Terminate
-                                                            {
-                                                                requested_terminate = true;
-                                                            } else if installed {
-                                                                requested_play = Some((
-                                                                    entry.id.clone(),
-                                                                    entry.title.clone(),
-                                                                    trusted
-                                                                        .expect(
-                                                                            "installed entries are trusted",
-                                                                        )
-                                                                        .system
-                                                                        .clone(),
-                                                                    layout.root.join(
-                                                                        trusted
-                                                                            .expect(
-                                                                                "installed entries are trusted",
-                                                                            )
-                                                                            .install_relative_path(),
-                                                                        ),
-                                                                ));
-                                                            } else if let Some(manifest) = imported.clone() {
-                                                                requested_play = Some((
-                                                                    entry.id.clone(),
-                                                                    entry.title.clone(),
-                                                                    manifest.system,
-                                                                    layout.root.join(
-                                                                        manifest
-                                                                            .launch_relative_path,
-                                                                    ),
-                                                                ));
-                                                            } else if let Some(trusted) = trusted {
-                                                                requested_install =
-                                                                    Some(trusted.clone());
-                                                            } else if supports_direct_download(entry)
-                                                            {
-                                                                requested_download =
-                                                                    Some(entry.clone());
-                                                            }
-                                                        }
-                                                        if imported_ready
-                                                            && ui
-                                                                .add_enabled(
-                                                                    remove_import_available(
-                                                                        imported_ready,
-                                                                        self.operation.is_some(),
-                                                                        self.running_game.is_some(),
-                                                                    ),
-                                                                    egui::Button::new(
-                                                                        egui::RichText::new(
-                                                                            "REMOVE",
-                                                                        )
-                                                                        .small()
-                                                                        .strong(),
-                                                                    )
-                                                                    .fill(egui::Color32::from_rgb(
-                                                                        113, 47, 55,
-                                                                    ))
-                                                                    .min_size(egui::vec2(
-                                                                        150.0, 26.0,
-                                                                    )),
-                                                                )
-                                                                .on_hover_text(
-                                                                    "Remove files owned by this import. Modified files are preserved.",
-                                                                )
-                                                                .clicked()
-                                                        {
-                                                            requested_remove_import = Some((
-                                                                entry.id.clone(),
-                                                                entry.title.clone(),
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                        });
-                                    if (card_index + 1) % grid_columns == 0 {
-                                        ui.end_row();
-                                    }
+                            for (card_index, &entry_index) in page.iter().enumerate() {
+                                let entry = &self.browse.entries[entry_index];
+                                if let Some(request) = self.card(ui, entry, card_width, artwork_height, &mut actions) {
+                                    artwork_requests.push(request);
                                 }
+                                if (card_index + 1) % grid_columns == 0 {
+                                    ui.end_row();
+                                }
+                            }
                         });
-                    if let Some(entry) = requested_import {
-                        self.import_dialog = Some(ImportDialog::new(entry));
+                    for &entry_index in &page {
+                        if let Some(texture) = self.textures.get_mut(&self.browse.entries[entry_index].id) {
+                            texture.1 = self.frame_number;
+                        }
                     }
-                    if let Some(entry) = requested_install {
-                        self.start_install(entry);
-                    }
-                    if let Some(entry) = requested_download {
-                        self.start_browse_download(entry);
-                    }
-                    if let Some(readiness) = requested_firmware {
-                        self.firmware_dialog = Some(FirmwareDialog::new(&readiness));
-                    }
-                    if let Some(entry) = requested_controls
-                        && let Some(controls) = &self.controls
-                    {
-                        let imported = self.imported_manifests.get(&entry.id);
-                        self.controls_dialog = Some(controls.for_game(&layout, &entry, imported));
-                    }
-                    if let Some((catalog_id, title)) = requested_remove_import {
-                        self.start_remove_import(catalog_id, title);
-                    }
-                    if requested_terminate {
-                        self.terminate_running_game();
-                    } else if let Some((catalog_id, title, system, rom)) = requested_play {
-                        self.launch_game(&catalog_id, &title, &system, &rom);
+                    self.evict_textures();
+                    for action in actions {
+                        self.perform(action);
                     }
                     self.start_browse_artwork(artwork_requests);
 
@@ -3092,9 +3556,9 @@ impl eframe::App for PortableApp {
                     if let Some(readiness) = &self.readiness {
                         ui.collapsing("SYSTEM READINESS", |ui| {
                             ui.label(format!(
-                                "{} titles have an installed backend · {} can provision a backend on first play · {} remain unresolved",
+                                "{} titles have an installed backend · {} have no installed emulator · {} remain unresolved",
                                 readiness.ready_now_entries,
-                                readiness.provision_on_first_play_entries,
+                                readiness.emulator_missing_entries,
                                 readiness.unresolved_entries
                             ));
                             ui.label(
@@ -3120,9 +3584,7 @@ impl eframe::App for PortableApp {
                             for system in attention {
                                 let backend = match system.backend {
                                     BackendState::ReadyNow => "backend ready",
-                                    BackendState::ProvisionOnFirstPlay => {
-                                        "emulator setup on first play"
-                                    }
+                                    BackendState::EmulatorMissing => "emulator not installed",
                                     BackendState::Unresolved => "backend unresolved",
                                 };
                                 let firmware = match system.firmware {
@@ -3161,18 +3623,18 @@ impl eframe::App for PortableApp {
                         });
                     }
                     ui.add_space(8.0);
-                    ui.collapsing("Bundle settings", |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Portable bundle:");
-                            ui.add_enabled(
-                                self.operation.is_none(),
-                                egui::TextEdit::singleline(&mut self.root_text)
-                                    .desired_width(f32::INFINITY)
-                                    .background_color(INPUT_BACKGROUND),
+                    ui.collapsing("Installation", |ui| {
+                        // The installation is the folder this launcher lives
+                        // in; RetroPort never switches to another one.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("This installation:");
+                            ui.label(
+                                egui::RichText::new(self.layout.root.display().to_string())
+                                    .monospace(),
                             );
                         });
-                        if !layout.retrobat_executable().is_file() {
-                            ui.label("Expected RetroBat/RetroBat.exe inside this folder.");
+                        if !self.retrobat_present {
+                            ui.label("RetroBat/RetroBat.exe is missing from this installation; run its bootstrap or verifier.");
                         }
                     });
                 });
@@ -3228,8 +3690,10 @@ fn decode_artwork_for_texture(bytes: &[u8]) -> image::ImageResult<DecodedArtwork
     limits.max_alloc = Some(64 * 1024 * 1024);
     reader.limits(limits);
     let decoded = reader.decode()?;
-    let decoded = if decoded.width() > 768 || decoded.height() > 768 {
-        decoded.resize(768, 768, image::imageops::FilterType::Triangle)
+    // Cards are at most a few hundred points wide; 512 px stays sharp at 2x
+    // while keeping each texture under 1 MiB.
+    let decoded = if decoded.width() > 512 || decoded.height() > 512 {
+        decoded.resize(512, 512, image::imageops::FilterType::Triangle)
     } else {
         decoded
     };
@@ -3429,14 +3893,20 @@ mod ui_tests {
     #[test]
     fn play_is_disabled_as_soon_as_a_game_starts_loading() {
         let (label, intent) = game_button_state(
-            Some(("mspacman", Duration::from_millis(10), false)),
+            Some((
+                "mspacman",
+                SessionPhase::Preparing,
+                Duration::from_millis(10),
+            )),
             "mspacman",
         );
         assert_eq!(label, "⏳  LOADING…");
         assert_eq!(intent, GameButtonIntent::Disabled);
 
-        let (other_label, other_intent) =
-            game_button_state(Some(("mspacman", Duration::from_secs(10), false)), "pacman");
+        let (other_label, other_intent) = game_button_state(
+            Some(("mspacman", SessionPhase::Running, Duration::from_secs(10))),
+            "pacman",
+        );
         assert_eq!(other_label, "GAME RUNNING");
         assert_eq!(other_intent, GameButtonIntent::Disabled);
     }
@@ -3444,7 +3914,7 @@ mod ui_tests {
     #[test]
     fn running_game_exposes_terminate_instead_of_a_second_play() {
         let (label, intent) = game_button_state(
-            Some(("mspacman", Duration::from_secs(10), false)),
+            Some(("mspacman", SessionPhase::Running, Duration::from_secs(10))),
             "mspacman",
         );
         assert_eq!(label, "■  TERMINATE");
@@ -3476,15 +3946,15 @@ mod ui_tests {
     #[test]
     fn fullscreen_game_does_not_keep_redrawing_the_covered_frontend() {
         assert_eq!(
-            active_game_repaint_delay(Duration::from_secs(1), false),
+            active_game_repaint_delay(Duration::from_secs(1), SessionPhase::Running),
             Some(Duration::from_millis(100))
         );
         assert_eq!(
-            active_game_repaint_delay(Duration::from_secs(6), false),
+            active_game_repaint_delay(Duration::from_secs(6), SessionPhase::Running),
             None
         );
         assert_eq!(
-            active_game_repaint_delay(Duration::from_secs(6), true),
+            active_game_repaint_delay(Duration::from_secs(6), SessionPhase::Terminating),
             Some(Duration::from_millis(100))
         );
     }
@@ -3507,8 +3977,8 @@ mod ui_tests {
             .unwrap();
 
         let decoded = decode_artwork_for_texture(encoded.get_ref()).unwrap();
-        assert!(decoded.size[0] <= 768);
-        assert!(decoded.size[1] <= 768);
+        assert!(decoded.size[0] <= 512);
+        assert!(decoded.size[1] <= 512);
         assert_eq!(decoded.rgba.len(), decoded.size[0] * decoded.size[1] * 4);
     }
 }

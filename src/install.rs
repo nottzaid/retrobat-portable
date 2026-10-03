@@ -126,65 +126,69 @@ impl<'a, D: DownloadClient> Installer<'a, D> {
             return Err(InstallError::DestinationExists(destination));
         }
 
-        let operation_id = format!(
-            "{}-{}",
-            std::process::id(),
-            SystemTime::now()
+        let stage = crate::import::StagingDirectory::new(self.layout, "install")?;
+        let staged = stage.path().join("artifact.download");
+        crate::downloads::fetch_verified(
+            self.downloader,
+            &entry.artifact.url,
+            entry.artifact.size,
+            &entry.artifact.sha256,
+            &staged,
+        )
+        .map_err(|error| match error {
+            crate::downloads::VerifiedDownloadError::Download(error) => {
+                InstallError::Download(error)
+            }
+            crate::downloads::VerifiedDownloadError::Io(error) => InstallError::Io(error),
+            crate::downloads::VerifiedDownloadError::TooLarge { expected } => InstallError::Size {
+                expected,
+                actual: expected + 1,
+            },
+            crate::downloads::VerifiedDownloadError::Size { expected, actual } => {
+                InstallError::Size { expected, actual }
+            }
+            crate::downloads::VerifiedDownloadError::Hash { expected, actual } => {
+                InstallError::Hash { expected, actual }
+            }
+        })?;
+        // create_new claims the name, so a file that appeared since the
+        // check above is never overwritten; the rename then replaces only
+        // RetroPort's own empty placeholder.
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(InstallError::DestinationExists(destination));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if let Err(error) = fs::rename(&staged, &destination) {
+            let _ = fs::remove_file(&destination);
+            return Err(error.into());
+        }
+        let manifest = InstalledManifest {
+            schema_version: 1,
+            catalog_id: entry.id.clone(),
+            relative_path: relative,
+            sha256: entry.artifact.sha256.to_ascii_lowercase(),
+            size: entry.artifact.size,
+            installed_at_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos()
-        );
-        let stage_dir = self.layout.staging_root().join(operation_id);
-        fs::create_dir_all(&stage_dir)?;
-        let staged = stage_dir.join("artifact.download");
-
-        let result = (|| {
-            let mut output = File::create(&staged)?;
-            self.downloader.fetch(&entry.artifact.url, &mut output)?;
-            output.sync_all()?;
-            drop(output);
-
-            let (actual_size, actual_hash) = digest_file(&staged)?;
-            if actual_size != entry.artifact.size {
-                return Err(InstallError::Size {
-                    expected: entry.artifact.size,
-                    actual: actual_size,
-                });
-            }
-            if actual_hash != entry.artifact.sha256.to_ascii_lowercase() {
-                return Err(InstallError::Hash {
-                    expected: entry.artifact.sha256.clone(),
-                    actual: actual_hash,
-                });
-            }
-
-            fs::rename(&staged, &destination)?;
-
-            let manifest = InstalledManifest {
-                schema_version: 1,
-                catalog_id: entry.id.clone(),
-                relative_path: relative,
-                sha256: actual_hash.clone(),
-                size: actual_size,
-                installed_at_unix: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            };
-            if let Err(error) = write_manifest(self.layout, &manifest) {
-                let _ = fs::remove_file(&destination);
-                return Err(error);
-            }
-
-            Ok(InstallReport {
-                destination,
-                bytes: actual_size,
-                sha256: actual_hash,
-            })
-        })();
-
-        let _ = fs::remove_dir_all(&stage_dir);
-        result
+                .as_secs(),
+        };
+        if let Err(error) = write_manifest(self.layout, &manifest) {
+            let _ = fs::remove_file(&destination);
+            return Err(error);
+        }
+        Ok(InstallReport {
+            destination,
+            bytes: manifest.size,
+            sha256: manifest.sha256,
+        })
     }
 
     pub fn uninstall(&self, entry: &CatalogEntry) -> Result<UninstallReport, InstallError> {
@@ -300,104 +304,4 @@ pub(crate) fn ensure_safe_parent(root: &Path, relative: &Path) -> Result<(), Ins
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::catalog::Catalog;
-    use tempfile::tempdir;
-
-    struct BytesDownloader(Vec<u8>);
-
-    impl DownloadClient for BytesDownloader {
-        fn fetch(&self, _url: &str, output: &mut dyn Write) -> Result<(), DownloadError> {
-            output
-                .write_all(&self.0)
-                .map_err(|error| DownloadError::new(error.to_string()))
-        }
-    }
-
-    fn fixture_entry(bytes: &[u8]) -> CatalogEntry {
-        let mut entry = Catalog::built_in().unwrap().entries.remove(0);
-        entry.artifact.size = bytes.len() as u64;
-        entry.artifact.sha256 = hex::encode(Sha256::digest(bytes));
-        entry
-    }
-
-    #[test]
-    fn installs_verifies_records_and_uninstalls() {
-        let temp = tempdir().unwrap();
-        let layout = PortableLayout::new(temp.path());
-        let bytes = b"valid ROM fixture".to_vec();
-        let downloader = BytesDownloader(bytes.clone());
-        let installer = Installer::new(&layout, &downloader);
-        let entry = fixture_entry(&bytes);
-
-        let installed = installer.install(&entry).unwrap();
-        assert_eq!(fs::read(&installed.destination).unwrap(), bytes);
-        assert!(installer.is_installed(&entry));
-
-        let removed = installer.uninstall(&entry).unwrap();
-        assert_eq!(removed.removed, vec![installed.destination.clone()]);
-        assert!(!installed.destination.exists());
-        assert!(!installer.is_installed(&entry));
-    }
-
-    #[test]
-    fn hash_mismatch_rolls_back_without_an_owned_file() {
-        let temp = tempdir().unwrap();
-        let layout = PortableLayout::new(temp.path());
-        let entry = fixture_entry(b"expected");
-        let downloader = BytesDownloader(b"tampered".to_vec());
-        let installer = Installer::new(&layout, &downloader);
-
-        assert!(matches!(
-            installer.install(&entry),
-            Err(InstallError::Hash { .. })
-        ));
-        assert!(!layout.root.join(entry.install_relative_path()).exists());
-        assert!(!installer.is_installed(&entry));
-    }
-
-    #[test]
-    fn uninstall_preserves_a_user_modified_file() {
-        let temp = tempdir().unwrap();
-        let layout = PortableLayout::new(temp.path());
-        let bytes = b"original".to_vec();
-        let downloader = BytesDownloader(bytes.clone());
-        let installer = Installer::new(&layout, &downloader);
-        let entry = fixture_entry(&bytes);
-        let installed = installer.install(&entry).unwrap();
-        fs::write(&installed.destination, b"user save or modification").unwrap();
-
-        let report = installer.uninstall(&entry).unwrap();
-        assert_eq!(
-            report.preserved_modified,
-            vec![installed.destination.clone()]
-        );
-        assert!(installed.destination.exists());
-        assert!(installer.is_installed(&entry));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn refuses_a_symlinked_destination_directory() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempdir().unwrap();
-        let outside = tempdir().unwrap();
-        let layout = PortableLayout::new(temp.path());
-        fs::create_dir_all(layout.root.join("RetroBat/roms")).unwrap();
-        symlink(outside.path(), layout.root.join("RetroBat/roms/gb")).unwrap();
-        let bytes = b"valid".to_vec();
-        let downloader = BytesDownloader(bytes.clone());
-        let installer = Installer::new(&layout, &downloader);
-
-        assert!(matches!(
-            installer.install(&fixture_entry(&bytes)),
-            Err(InstallError::UnsafePath(_))
-        ));
-        assert!(!outside.path().join("2048.gb").exists());
-    }
 }

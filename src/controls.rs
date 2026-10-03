@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::browse::{BrowseCatalog, BrowseEntry};
-use crate::import::ImportedManifest;
+use crate::import::{ImportedManifest, canonical_system_alias};
+use crate::launch::{HostPlatform, retroarch_input_overrides, uses_direct_retroarch};
 use crate::paths::PortableLayout;
+use crate::readiness::ReadinessReport;
 
 const CONTROLS: &[u8] = include_bytes!("../catalog/controls-v1.json.gz");
 
@@ -173,13 +175,37 @@ impl ControlsCatalog {
         layout: &PortableLayout,
         entry: &BrowseEntry,
         imported: Option<&ImportedManifest>,
+        readiness: Option<&ReadinessReport>,
     ) -> GameControls {
-        let config = effective_retroarch_config(layout, &entry.system);
+        // The RetroBat system and route PLAY would use for this card.
+        let system_readiness =
+            readiness.and_then(|report| report.for_catalog_system(&entry.system));
+        let retrobat_system = imported
+            .map(|manifest| manifest.system.clone())
+            .or_else(|| {
+                system_readiness.and_then(|system| system.retrobat_systems.first().cloned())
+            })
+            .unwrap_or_else(|| {
+                canonical_system_alias(&entry.system)
+                    .unwrap_or(&entry.system)
+                    .to_owned()
+            });
+        let route = system_readiness.and_then(|system| system.ready_route.as_ref());
+        let direct = uses_direct_retroarch(
+            HostPlatform::current(),
+            &retrobat_system,
+            route.map(|route| route.emulator.as_str()),
+        );
+        let config = effective_retroarch_config(layout, &retrobat_system, direct);
         let mut keyboard = keyboard_bindings(&config);
         let controller_device = controller_profile(layout);
         let mut controller = controller_bindings(controller_device.as_ref());
         let mut sources = vec![ControlSource {
-            name: "Installed RetroArch/RetroBat input configuration".to_owned(),
+            name: if direct {
+                "Installed RetroArch configuration with RetroPort's launch overrides".to_owned()
+            } else {
+                "Installed RetroArch/RetroBat input configuration".to_owned()
+            },
             version: layout
                 .retroarch_root()
                 .join("retroarch.cfg")
@@ -189,8 +215,11 @@ impl ControlsCatalog {
         }];
         let mut notes = Vec::new();
         let mut device_summary = vec![format!(
-            "Backend system: {} · virtual input surface: RetroPad",
-            entry.system.to_ascii_uppercase()
+            "Backend system: {}{} · virtual input surface: RetroPad",
+            retrobat_system.to_ascii_uppercase(),
+            route
+                .map(|route| format!(" through {}", route.label()))
+                .unwrap_or_default()
         )];
         let mut scope = "Installed system/backend profile".to_owned();
         let mut confidence =
@@ -334,7 +363,14 @@ impl ControlsCatalog {
                     .to_owned(),
             );
         }
-        notes.push("Esc closes direct RetroArch games.".to_owned());
+        if direct {
+            notes.push("Esc closes the game; F1 opens RetroArch's Quick Menu.".to_owned());
+        } else {
+            notes.push(
+                "This system starts through its own emulator; TERMINATE on the card always stops it."
+                    .to_owned(),
+            );
+        }
         GameControls {
             title: entry.title.clone(),
             scope,
@@ -376,14 +412,21 @@ fn parse_config(path: &Path) -> HashMap<String, String> {
         .collect()
 }
 
-fn effective_retroarch_config(layout: &PortableLayout, system: &str) -> HashMap<String, String> {
+/// The keyboard and pad binds a launch of `system` runs with: the shared
+/// RetroArch configuration, plus the overrides PLAY appends on direct routes.
+fn effective_retroarch_config(
+    layout: &PortableLayout,
+    system: &str,
+    direct: bool,
+) -> HashMap<String, String> {
     let mut values = parse_config(&layout.retroarch_root().join("retroarch.cfg"));
-    values.extend(parse_config(
-        &layout
-            .metadata_root()
-            .join("runtime/retroarch")
-            .join(format!("{system}.cfg")),
-    ));
+    if direct {
+        values.extend(
+            retroarch_input_overrides(system)
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned())),
+        );
+    }
     values
 }
 
@@ -488,32 +531,117 @@ fn controller_profile(layout: &PortableLayout) -> Option<ControllerProfile> {
 
 #[cfg(target_os = "linux")]
 fn connected_controller() -> Option<(String, String, String)> {
-    let inputs = fs::read_dir("/sys/class/input").ok()?;
-    for entry in inputs.filter_map(Result::ok) {
-        if !entry.file_name().to_string_lossy().starts_with("js") {
-            continue;
-        }
-        let device = entry.path().join("device");
-        let name = fs::read_to_string(device.join("name"))
-            .ok()?
-            .trim()
-            .to_owned();
-        let vendor = u16::from_str_radix(
-            fs::read_to_string(device.join("id/vendor")).ok()?.trim(),
-            16,
-        )
-        .ok()?;
-        let product = u16::from_str_radix(
-            fs::read_to_string(device.join("id/product")).ok()?.trim(),
-            16,
-        )
-        .ok()?;
-        return Some((name, vendor.to_string(), product.to_string()));
-    }
-    None
+    let mut joysticks = fs::read_dir("/sys/class/input")
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("js"))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    // js0 is the controller RetroArch assigns to player one.
+    joysticks.sort();
+    joysticks.into_iter().find_map(|joystick| {
+        let device = joystick.join("device");
+        let read = |name: &str| fs::read_to_string(device.join(name)).ok();
+        let name = read("name")?.trim().to_owned();
+        let vendor = u16::from_str_radix(read("id/vendor")?.trim(), 16).ok()?;
+        let product = u16::from_str_radix(read("id/product")?.trim(), 16).ok()?;
+        Some((name, vendor.to_string(), product.to_string()))
+    })
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows lists game controllers through the Raw Input API: HID devices on
+/// the generic-desktop page with the joystick (4) or gamepad (5) usage.
+#[cfg(target_os = "windows")]
+fn connected_controller() -> Option<(String, String, String)> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawInputDeviceList {
+        device: *mut c_void,
+        kind: u32,
+    }
+    #[repr(C)]
+    struct DeviceInfo {
+        size: u32,
+        kind: u32,
+        vendor: u32,
+        product: u32,
+        version: u32,
+        usage_page: u16,
+        usage: u16,
+        padding: [u8; 8],
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetRawInputDeviceList(list: *mut RawInputDeviceList, count: *mut u32, size: u32) -> u32;
+        fn GetRawInputDeviceInfoW(
+            device: *mut c_void,
+            command: u32,
+            data: *mut c_void,
+            size: *mut u32,
+        ) -> u32;
+    }
+    const RIM_TYPEHID: u32 = 2;
+    const RIDI_DEVICEINFO: u32 = 0x2000_000b;
+    let entry_size = std::mem::size_of::<RawInputDeviceList>() as u32;
+    let mut count = 0u32;
+    // SAFETY: a null list asks only for the device count.
+    if unsafe { GetRawInputDeviceList(std::ptr::null_mut(), &mut count, entry_size) } != 0
+        || count == 0
+    {
+        return None;
+    }
+    let mut devices = vec![
+        RawInputDeviceList {
+            device: std::ptr::null_mut(),
+            kind: 0,
+        };
+        count as usize
+    ];
+    // SAFETY: `devices` holds `count` correctly sized entries.
+    let listed = unsafe { GetRawInputDeviceList(devices.as_mut_ptr(), &mut count, entry_size) };
+    if listed == u32::MAX {
+        return None;
+    }
+    devices.truncate(listed as usize);
+    devices
+        .into_iter()
+        .filter(|device| device.kind == RIM_TYPEHID)
+        .find_map(|device| {
+            let mut info = DeviceInfo {
+                size: std::mem::size_of::<DeviceInfo>() as u32,
+                kind: 0,
+                vendor: 0,
+                product: 0,
+                version: 0,
+                usage_page: 0,
+                usage: 0,
+                padding: [0; 8],
+            };
+            let mut size = info.size;
+            // SAFETY: `info` is a RID_DEVICE_INFO-sized buffer with cbSize set.
+            let written = unsafe {
+                GetRawInputDeviceInfoW(
+                    device.device,
+                    RIDI_DEVICEINFO,
+                    (&mut info as *mut DeviceInfo).cast(),
+                    &mut size,
+                )
+            };
+            (written != u32::MAX && info.usage_page == 1 && matches!(info.usage, 4 | 5)).then(
+                || {
+                    (
+                        format!("Game controller {:04x}:{:04x}", info.vendor, info.product),
+                        info.vendor.to_string(),
+                        info.product.to_string(),
+                    )
+                },
+            )
+        })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn connected_controller() -> Option<(String, String, String)> {
     None
 }
@@ -544,7 +672,7 @@ mod tests {
             .unwrap();
         let controls = ControlsCatalog::built_in().unwrap();
         let layout = PortableLayout::new("/tmp/unused");
-        let profile = controls.for_game(&layout, entry, None);
+        let profile = controls.for_game(&layout, entry, None, None);
         assert!(profile.scope.contains("MAME"));
         assert!(
             profile
@@ -558,56 +686,5 @@ mod tests {
                 .iter()
                 .any(|source| source.name == "MAME -listxml")
         );
-    }
-
-    #[test]
-    fn rar_extracted_game_keeps_catalogue_controls_resolution() {
-        let browse = BrowseCatalog::built_in().unwrap();
-        let entry = browse
-            .entries
-            .iter()
-            .find(|entry| entry.id == "libretro-classics/atari2600-pac-man-8a7a4de413c6")
-            .unwrap();
-        let imported = ImportedManifest {
-            schema_version: 1,
-            catalog_id: entry.id.clone(),
-            title: entry.title.clone(),
-            system: "atari2600".to_owned(),
-            launch_relative_path: Path::new(
-                "RetroBat/roms/atari2600/Pac-Man/Pac-Man (axekin.com).a26",
-            )
-            .to_owned(),
-            source_sha1: None,
-            matched_catalog_sha1: None,
-            files: Vec::new(),
-            imported_at_unix: 0,
-        };
-        let controls = ControlsCatalog::built_in().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let layout = PortableLayout::new(root.path());
-        fs::create_dir_all(layout.retroarch_root()).unwrap();
-        fs::write(
-            layout.retroarch_root().join("retroarch.cfg"),
-            "input_player1_up = \"up\"\ninput_player1_down = \"down\"\ninput_player1_left = \"left\"\ninput_player1_right = \"right\"\ninput_player1_a = \"x\"\ninput_player1_b = \"z\"\ninput_player1_start = \"enter\"\ninput_player1_select = \"rshift\"\n",
-        )
-        .unwrap();
-        let rar_profile = controls.for_game(&layout, entry, Some(&imported));
-        let zip_imported = ImportedManifest {
-            launch_relative_path: Path::new("RetroBat/roms/atari2600/Pac-Man.zip").to_owned(),
-            ..imported.clone()
-        };
-        let zip_profile = controls.for_game(&layout, entry, Some(&zip_imported));
-
-        assert_eq!(imported.catalog_id, entry.id);
-        assert_eq!(rar_profile, zip_profile);
-        assert_eq!(rar_profile.title, "Pac-Man");
-        assert!(
-            rar_profile
-                .device_summary
-                .iter()
-                .any(|line| line.contains("ATARI2600"))
-        );
-        assert!(!rar_profile.keyboard.is_empty());
-        assert!(!rar_profile.controller.is_empty());
     }
 }

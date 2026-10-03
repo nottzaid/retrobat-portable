@@ -4,6 +4,7 @@ pub mod browse_install;
 pub mod catalog;
 pub mod controller_guard;
 pub mod controls;
+pub mod downloads;
 pub mod featured;
 pub mod firmware;
 pub mod import;
@@ -11,10 +12,15 @@ pub mod install;
 pub mod launch;
 pub mod paths;
 pub mod readiness;
+pub mod session;
 pub mod sources;
+pub mod vita;
+pub mod xiso;
+
+use std::collections::BTreeMap;
+use std::time::Instant;
 
 use serde::Serialize;
-use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::{
@@ -46,10 +52,14 @@ pub struct SelfCheck {
     pub chip8_core_present: bool,
     pub import_coverage: Option<ImportCoverage>,
     pub download_coverage: DownloadCoverage,
+    /// Pinned downloads whose final file their system does not accept.
+    pub unplayable_downloads: Vec<String>,
     pub readiness: Option<ReadinessReport>,
     pub featured_readiness: Option<FeaturedReadinessAudit>,
     pub controls_coverage: ControlsCoverage,
     pub target_platform: &'static str,
+    /// How long each audit phase took, for diagnosing slow storage.
+    pub timings_ms: BTreeMap<&'static str, u64>,
 }
 
 #[derive(Debug, Error)]
@@ -66,31 +76,46 @@ pub enum SelfCheckError {
     Featured(#[from] featured::FeaturedError),
     #[error(transparent)]
     Controls(#[from] controls::ControlsError),
+    #[error(transparent)]
+    Downloads(#[from] downloads::LedgerError),
 }
 
 pub fn self_check(layout: &PortableLayout) -> Result<SelfCheck, SelfCheckError> {
+    let mut timings_ms = BTreeMap::new();
+    let mut clock = Instant::now();
+    let mut lap = |phase: &'static str| {
+        timings_ms.insert(phase, clock.elapsed().as_millis() as u64);
+        clock = Instant::now();
+    };
     let catalog = Catalog::built_in()?;
     let browse = BrowseCatalog::built_in()?;
     let host = HostPlatform::current();
-    let trusted_ids = catalog
-        .entries
-        .iter()
-        .map(|entry| entry.id.as_str())
-        .collect::<HashSet<_>>();
-    let download_coverage = audit_download_coverage(&browse.entries, &trusted_ids);
+    lap("catalogues");
+    let ledger = downloads::DownloadLedger::built_in()?;
+    let download_coverage = audit_download_coverage(&browse.entries);
+    lap("download_ledger");
+    let unplayable_downloads = if layout.systems_config().is_file() {
+        GameImporter::new(layout).audit_download_formats(&browse.entries, &ledger)?
+    } else {
+        Vec::new()
+    };
     let import_coverage = if layout.systems_config().is_file() {
         Some(GameImporter::new(layout).audit_coverage(&browse.entries)?)
     } else {
         None
     };
+    lap("import_coverage");
     let readiness = if layout.systems_config().is_file() {
         Some(ReadinessReport::audit(layout, &browse.entries)?)
     } else {
         None
     };
+    lap("readiness");
     let bundled_artwork = audit_bundled_artwork(layout, &browse.entries);
+    lap("bundled_artwork");
     let featured = FeaturedCatalog::built_in(&browse)?;
     let controls_coverage = ControlsCatalog::built_in()?.audit_coverage(&browse);
+    lap("featured_and_controls");
     let featured_readiness = readiness
         .as_ref()
         .map(|report| featured.audit_readiness(&browse, report));
@@ -116,9 +141,11 @@ pub fn self_check(layout: &PortableLayout) -> Result<SelfCheck, SelfCheckError> 
         chip8_core_present: layout.retroarch_core("jaxe").is_file(),
         import_coverage,
         download_coverage,
+        unplayable_downloads,
         readiness,
         featured_readiness,
         controls_coverage,
         target_platform: host.as_str(),
+        timings_ms,
     })
 }

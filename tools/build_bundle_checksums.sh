@@ -25,6 +25,9 @@ runtime_files=(
     RetroBat/emulators/retroarch/cores/jaxe_libretro.dll \
     RetroBat/emulators/xenia-canary/xenia_canary.exe \
     RetroBat/emulators/xenia-canary/LICENSE-XENIA.txt \
+    RetroBat/RetroBat.exe \
+    RetroBat/emulationstation/emulationstation.exe \
+    RetroBat/emulationstation/emulatorLauncher.exe \
     RetroBat/emulators/play/Play.exe
 )
 for required in "${runtime_files[@]}"
@@ -41,6 +44,10 @@ printf '%s\0' "${runtime_files[@]}" > "$static_list"
 
 for directory in \
     Runtime/Linux \
+    RetroBat/emulators/play/platforms \
+    RetroBat/emulators/play/imageformats \
+    RetroBat/emulators/play/styles \
+    RetroBat/emulators/play/arcadedefs \
     RetroBat/emulators/eden/LICENSES \
     RetroBat/emulators/cxbx-reloaded/hlsl \
     RetroBat/emulators/rpcs3/Icons \
@@ -55,6 +62,7 @@ do
 done
 
 for directory in \
+    RetroBat/emulators/play \
     RetroBat/emulators/eden \
     RetroBat/emulators/cxbx-reloaded \
     RetroBat/emulators/rpcs3 \
@@ -66,6 +74,7 @@ do
             ! -name 'settings.ini' \
             ! -name 'RPCS3.buf' \
             ! -name 'portable.txt' \
+            ! -name '*.installer-bak*' \
             -print0 >> "$static_list"
     fi
 done
