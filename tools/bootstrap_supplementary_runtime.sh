@@ -161,6 +161,38 @@ play=$(fetch \
 install_nsis "$play" "$root/RetroBat/emulators/play" Play.exe \
     ec4cc5ba8f0865c544f03b51e1c3534bfa1020f3cbdddedeac4f29dc824930b9
 
+# PCSX2: the reference PS2 emulator once the owner's BIOS is present. Its
+# self-updater is left out; RetroPort updates only through these pins.
+pcsx2_win=$(fetch \
+    pcsx2-v2.8.2-windows-x64-Qt.7z \
+    https://github.com/PCSX2/pcsx2/releases/download/v2.8.2/pcsx2-v2.8.2-windows-x64-Qt.7z \
+    7dfc829ca1994cc1045ac49f05e39b6cf968b72e6a374c40e05c2a2b4ac200b4)
+install_archive "$pcsx2_win" pcsx2-qt.exe "$root/RetroBat/emulators/pcsx2"
+rm -f "$root/RetroBat/emulators/pcsx2/updater.exe"
+
+# xemu: the reference original-Xbox emulator once the owner's BIOS is present.
+xemu_win=$(fetch \
+    xemu-0.8.136-windows-x86_64.zip \
+    https://github.com/xemu-project/xemu/releases/download/v0.8.136/xemu-0.8.136-windows-x86_64.zip \
+    b25a6c24a2c2c36a0843a153cd9ee59ca6833ef87bdcd855ba0824930e4ddd1d)
+install_archive "$xemu_win" xemu.exe "$root/RetroBat/emulators/xemu"
+# xemu's official blank, formatted Xbox hard disk. RetroPort copies it into
+# saves/xbox on first PLAY and never overwrites the copy games save onto.
+xemu_hdd=$(fetch \
+    xbox_hdd.qcow2-1.0.zip \
+    https://github.com/xemu-project/xemu-hdd-image/releases/download/1.0/xbox_hdd.qcow2.zip \
+    d9f5a4c1224ff24cf9066067bda70cc8b9c874ea22b9c542eb2edbfc4621bb39)
+install_member "$xemu_hdd" xbox_hdd.qcow2 \
+    "$root/RetroBat/emulators/xemu/xbox_hdd.blank.qcow2" \
+    eb35d069715dfc0d37cfac086a0b73a89a02e8f12519cd8eda82ad479d1a4eed
+
+# Vita3K publishes numbered builds alongside its rolling one.
+vita3k_win=$(fetch \
+    vita3k-4115-a366df69-windows-x86_64.7z \
+    https://github.com/Vita3K/Vita3K-builds/releases/download/4115/vita3k-4115-a366df69-windows-x86_64.7z \
+    35aead1c59a684f15b30e87cc18cdc34d535bca3873d711fa2ac92d9adb90897)
+install_archive "$vita3k_win" Vita3K.exe "$root/RetroBat/emulators/vita3k"
+
 # Native Linux routes.
 xenia_linux=$(fetch \
     XeniaCanary-6e5b832.AppImage \
@@ -196,5 +228,23 @@ eden_linux=$(fetch \
     https://stable.eden-emu.dev/v0.2.1/Eden-Linux-v0.2.1-amd64-gcc-standard.AppImage \
     2fae658397daf13c118082a3eb65d61a6519967b5e22e6667756baecf6000c5a)
 install_direct "$eden_linux" "$root/Runtime/Linux/Eden.AppImage"
+
+pcsx2_linux=$(fetch \
+    pcsx2-v2.8.2-linux-appimage-x64-Qt.AppImage \
+    https://github.com/PCSX2/pcsx2/releases/download/v2.8.2/pcsx2-v2.8.2-linux-appimage-x64-Qt.AppImage \
+    0c46bb6a88aa2782b10853a7b07cf3387ba99cbef2b966372cd2315b8571abea)
+install_direct "$pcsx2_linux" "$root/Runtime/Linux/PCSX2.AppImage"
+
+xemu_linux=$(fetch \
+    xemu-0.8.136-x86_64.AppImage \
+    https://github.com/xemu-project/xemu/releases/download/v0.8.136/xemu-0.8.136-x86_64.AppImage \
+    ac77363a599109194ba2af3caa695348d199f515cf1d0fde091beb629e0c3103)
+install_direct "$xemu_linux" "$root/Runtime/Linux/xemu.AppImage"
+
+vita3k_linux=$(fetch \
+    Vita3K-4115-x86_64.AppImage \
+    https://github.com/Vita3K/Vita3K-builds/releases/download/4115/Vita3K-x86_64.AppImage \
+    ffce3720027ff8cee3505e25b6264eda12c6457f7ba31cecae26a90f87caf48e)
+install_direct "$vita3k_linux" "$root/Runtime/Linux/Vita3K.AppImage"
 
 echo "Installed and verified all pinned supplementary Windows and Linux backends."

@@ -828,8 +828,10 @@ pub fn remove_import(
         prune_empty_import_directories(&parent, &system_root)?;
     }
     {
-        // A disc's unpacked copy is RetroPort's own derived data.
+        // A disc's unpacked copy, or a Vita package's installed app, is
+        // RetroPort's own derived data.
         let launch = layout.root.join(&manifest.launch_relative_path);
+        crate::vita::uninstall_package(layout, &launch)?;
         let unpacked = layout.unpacked_disc(&launch);
         for directory in [unpacked.with_extension("unpacking"), unpacked] {
             match fs::remove_dir_all(&directory) {

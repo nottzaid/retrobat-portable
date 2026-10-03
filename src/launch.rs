@@ -54,6 +54,14 @@ pub enum RuntimeSetting {
         key: String,
         value: String,
     },
+    /// Copy `from` to `to` only if `to` does not exist yet.
+    SeedCopy { from: PathBuf, to: PathBuf },
+    /// Ensure the top-level `key: value` of a YAML file.
+    YamlValue {
+        path: PathBuf,
+        key: String,
+        value: String,
+    },
 }
 
 /// What the Wine prefix must provide before a Linux launch through Wine.
@@ -85,6 +93,9 @@ pub struct LaunchPlan {
     pub refusal: Option<LauncherRefusal>,
     /// A disc image unpacked (once) before the emulator starts.
     pub unpacked_disc: Option<UnpackedDisc>,
+    /// A PS Vita package installed into Vita3K before it starts, by its
+    /// title ID: (installation root, package).
+    pub vita_package: Option<(PathBuf, PathBuf)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,6 +210,8 @@ pub enum LaunchError {
     WineMonoMissing(PathBuf),
     #[error(transparent)]
     XboxDisc(#[from] crate::xiso::XisoError),
+    #[error(transparent)]
+    Vita(#[from] crate::vita::VitaError),
     #[error("failed to start the backend: {0}")]
     Io(#[from] io::Error),
 }
@@ -217,6 +230,7 @@ impl LaunchPlan {
             log_file: None,
             refusal: None,
             unpacked_disc: None,
+            vita_package: None,
         }
     }
 
@@ -321,6 +335,13 @@ impl LaunchPlan {
                 WineRequirement::Prefix,
             );
         }
+        if backend.is_some_and(|route| route.emulator.eq_ignore_ascii_case("vita3k")) {
+            // This Vita3K ignores a package on its command line, so RetroPort
+            // installs it and starts it by title ID on both hosts.
+            let mut plan = vita3k_plan(layout, host, vec!["-F".into()])?;
+            plan.vita_package = Some((layout.root.clone(), rom.to_owned()));
+            return Ok(plan);
+        }
         if host == HostPlatform::Linux
             && let Some(backend) = backend
             && let Some(plan) = native_linux_game_plan(layout, backend, rom)
@@ -364,6 +385,9 @@ impl LaunchPlan {
             )?,
         };
         plan.unpacked_disc = unpacked_disc;
+        if emulator.as_deref() == Some("xemu") {
+            plan.settings.push(xemu_hard_disk(layout));
+        }
         plan.refusal = Some(LauncherRefusal {
             temp: match &plan.wine {
                 Some((prefix, _)) => RefusalTemp::WinePrefix(prefix.clone()),
@@ -588,10 +612,13 @@ impl LaunchPlan {
     /// process group. Preparing a new Wine prefix can take a minute, so call
     /// this from a worker thread; `progress` receives user-facing phases.
     pub fn spawn(&self, progress: &dyn Fn(&str)) -> Result<Child, LaunchError> {
-        self.prepare_runtime(progress)?;
+        let prepared = self.prepare_runtime(progress)?;
 
         let mut command = Command::new(&self.program);
-        command.args(&self.args).current_dir(&self.current_dir);
+        command
+            .args(&self.args)
+            .args(prepared)
+            .current_dir(&self.current_dir);
         #[cfg(unix)]
         command.process_group(0);
         for (key, value) in &self.env {
@@ -600,8 +627,9 @@ impl LaunchPlan {
         Ok(command.spawn()?)
     }
 
-    /// Prepares everything the backend needs.
-    pub fn prepare_runtime(&self, progress: &dyn Fn(&str)) -> Result<(), LaunchError> {
+    /// Prepares everything the backend needs; returns arguments that only
+    /// preparation can determine (an installed Vita app's title ID).
+    pub fn prepare_runtime(&self, progress: &dyn Fn(&str)) -> Result<Vec<OsString>, LaunchError> {
         for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] {
             if let Some(directory) = self.env.get(key) {
                 fs::create_dir_all(directory)?;
@@ -646,7 +674,13 @@ impl LaunchPlan {
         if let Some((prefix, requirement)) = &self.wine {
             prepare_wine_prefix(prefix, *requirement, progress)?;
         }
-        Ok(())
+        let mut arguments = Vec::new();
+        if let Some((root, package)) = &self.vita_package {
+            progress("Installing the PS Vita package into Vita3K (first PLAY only)…");
+            let title = crate::vita::install_package(&PortableLayout::new(root), package)?;
+            arguments.extend(["-r".into(), title.into()]);
+        }
+        Ok(arguments)
     }
 }
 
@@ -739,7 +773,57 @@ fn apply_runtime_setting(setting: &RuntimeSetting) -> io::Result<()> {
             }
             Ok(())
         }
+        RuntimeSetting::SeedCopy { from, to } => {
+            if to.exists() {
+                return Ok(());
+            }
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(from, to).map(|_| ())
+        }
+        RuntimeSetting::YamlValue { path, key, value } => {
+            let existing = match fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(error),
+            };
+            let updated = set_yaml_value(&existing, key, value);
+            if updated != existing {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, updated)?;
+            }
+            Ok(())
+        }
     }
+}
+
+/// Sets a top-level `key: value` line, leaving every other line as it is.
+fn set_yaml_value(contents: &str, key: &str, value: &str) -> String {
+    let line = format!("{key}: {value}");
+    let mut found = false;
+    let mut lines = contents
+        .lines()
+        .map(|existing| {
+            let is_key = existing
+                .strip_prefix(key)
+                .is_some_and(|rest| rest.trim_start().starts_with(':'));
+            if is_key && !found {
+                found = true;
+                line.clone()
+            } else {
+                existing.to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    if !found {
+        lines.push(line);
+    }
+    let mut updated = lines.join("\n");
+    updated.push('\n');
+    updated
 }
 
 fn set_ini_value(contents: &str, section: &str, key: &str, value: &str) -> String {
@@ -1077,12 +1161,122 @@ fn native_linux_game_plan(
             vec![rom.into()],
             "xenia-canary",
         ),
+        // -batch exits with the game; -nogui keeps the library window away.
+        "pcsx2" => (
+            runtime.join("PCSX2.AppImage"),
+            vec![
+                "-batch".into(),
+                "-nogui".into(),
+                "-fullscreen".into(),
+                "--".into(),
+                rom.into(),
+            ],
+            "pcsx2",
+        ),
+        "xemu" => (
+            runtime.join("xemu.AppImage"),
+            vec!["-full-screen".into()],
+            "xemu",
+        ),
         _ => return None,
     };
     if !program.is_file() {
         return None;
     }
-    Some(native_linux_plan(layout, program, args, key))
+    let mut plan = native_linux_plan(layout, program, args, key);
+    if key == "xemu" {
+        // xemu reads every path, the disc included, from its configuration.
+        let config = layout
+            .metadata_root()
+            .join("runtime/linux/xemu/data/xemu/xemu/xemu.toml");
+        let bios = layout.retrobat_root().join("bios");
+        let saves = layout.retrobat_root().join("saves").join("xbox");
+        let contents = format!(
+            "[general]\nshow_welcome = false\n\n[general.updates]\ncheck = false\n\n\
+             [display.window]\nfullscreen_on_startup = true\n\n[sys.files]\n\
+             bootrom_path = {}\nflashrom_path = {}\neeprom_path = {}\nhdd_path = {}\ndvd_path = {}\n",
+            toml_string(&bios.join("mcpx_1.0.bin")),
+            toml_string(&bios.join("Complex_4627.bin")),
+            toml_string(&saves.join("eeprom.bin")),
+            toml_string(&saves.join("xbox_hdd.qcow2")),
+            toml_string(rom),
+        );
+        plan.generated_files.push((config, contents));
+        plan.settings.push(xemu_hard_disk(layout));
+    }
+    Some(plan)
+}
+
+/// The blank formatted hard disk xemu needs, copied once from the pinned
+/// template; afterwards it holds the games' saves and is never replaced.
+fn xemu_hard_disk(layout: &PortableLayout) -> RuntimeSetting {
+    RuntimeSetting::SeedCopy {
+        from: layout.emulator_root("xemu").join("xbox_hdd.blank.qcow2"),
+        to: layout
+            .retrobat_root()
+            .join("saves")
+            .join("xbox")
+            .join("xbox_hdd.qcow2"),
+    }
+}
+
+/// A TOML string for `path`: a literal string unless it contains a quote.
+fn toml_string(path: &Path) -> String {
+    let text = path.display().to_string();
+    if text.contains('\'') {
+        format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        format!("'{text}'")
+    }
+}
+
+fn vita3k_plan(
+    layout: &PortableLayout,
+    host: HostPlatform,
+    args: Vec<OsString>,
+) -> Result<LaunchPlan, LaunchError> {
+    let data = crate::vita::data_root(layout);
+    match host {
+        HostPlatform::Linux => {
+            let program = layout.linux_runtime_root().join("Vita3K.AppImage");
+            let mut plan = native_linux_plan(layout, program, args, "vita3k");
+            let config = layout
+                .metadata_root()
+                .join("runtime/linux/vita3k/config/Vita3K/config.yml");
+            plan.settings.extend(vita3k_settings(config, &data));
+            Ok(plan)
+        }
+        HostPlatform::Windows => {
+            let root = layout.emulator_root("vita3k");
+            let mut plan = LaunchPlan::new(root.join("Vita3K.exe"), &root);
+            plan.args = args;
+            plan.settings = vita3k_settings(root.join("config.yml"), &data);
+            Ok(plan)
+        }
+        HostPlatform::Unsupported => Err(LaunchError::Unsupported),
+    }
+}
+
+/// Without these Vita3K opens its first-run setup (and, with no data path,
+/// aborts), shows a welcome screen, checks for updates, shows the game
+/// inside its library window, and logs every trace message.
+fn vita3k_settings(config: PathBuf, data: &Path) -> Vec<RuntimeSetting> {
+    let data = format!("'{}'", data.display().to_string().replace('\'', "''"));
+    [
+        ("initial-setup", "true".to_owned()),
+        ("show-welcome", "false".to_owned()),
+        ("check-for-updates-mode", "0".to_owned()),
+        ("boot-apps-full-screen", "true".to_owned()),
+        ("log-level", "2".to_owned()),
+        ("pref-path", data),
+    ]
+    .into_iter()
+    .map(|(key, value)| RuntimeSetting::YamlValue {
+        path: config.clone(),
+        key: key.to_owned(),
+        value,
+    })
+    .collect()
 }
 
 fn native_linux_plan(
@@ -1130,6 +1324,30 @@ fn native_linux_plan(
             )
             .to_owned(),
         }],
+        // Without these PCSX2 waits in its setup wizard (invisible behind
+        // -nogui), looks for a BIOS in its own data folder, and checks for
+        // updates.
+        "pcsx2" => {
+            let ini = config.join("PCSX2").join("inis").join("PCSX2.ini");
+            let bios = layout
+                .retrobat_root()
+                .join("bios")
+                .join("pcsx2")
+                .join("bios");
+            [
+                ("UI", "SetupWizardIncomplete", "false".to_owned()),
+                ("Folders", "Bios", bios.display().to_string()),
+                ("AutoUpdater", "CheckAtStartup", "false".to_owned()),
+            ]
+            .into_iter()
+            .map(|(section, key, value)| RuntimeSetting::IniValue {
+                path: ini.clone(),
+                section: section.to_owned(),
+                key: key.to_owned(),
+                value,
+            })
+            .collect()
+        }
         // RPCS3's welcome dialog and its update check both interrupt an
         // unattended start (the firmware installer runs its GUI).
         "rpcs3" => {

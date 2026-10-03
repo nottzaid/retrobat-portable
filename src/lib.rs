@@ -14,6 +14,7 @@ pub mod paths;
 pub mod readiness;
 pub mod session;
 pub mod sources;
+pub mod vita;
 pub mod xiso;
 
 use serde::Serialize;
