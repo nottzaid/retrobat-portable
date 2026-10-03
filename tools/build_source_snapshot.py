@@ -13,10 +13,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SOURCE_TREES = (".cargo", "catalog", "src", "tests", "tools")
 ROOT_FILES = (
     ".gitignore",
-    "ARCHITECTURE.md",
     "Cargo.lock",
     "Cargo.toml",
-    "DEPENDENCIES.md",
     "LICENSE",
     "README.md",
     "rust-toolchain.toml",

@@ -1,246 +1,163 @@
 # RetroPort
 
-RetroPort is one artwork-first library for emulated games on Windows and Linux.
-Browse by cover, source, or system; search the entire catalogue; then act from
-the game card:
+An artwork-first game library for Windows and Linux over RetroBat. Browse
+80,734 games by cover, source, or system, then act from the card:
 
-- **DOWNLOAD** fetches and verifies a game hosted by its publisher or project.
-- **IMPORT GAME** copies a local ROM, disc set, executable, or extracted game.
-- **PLAY** opens that exact copy through the installed backend.
-- **CONTROLS** shows the keyboard, controller, and special hardware mapping—and
-  identifies its evidence instead of inventing game-specific directions.
+- **DOWNLOAD** fetches the publisher's exact file, verifies size and SHA-256
+  while it streams, and installs it.
+- **IMPORT GAME** copies your own ROM, disc set, archive, or game folder.
+- **PLAY** starts that copy on the best installed emulator; **TERMINATE** stops
+  its whole process tree.
+- **CONTROLS** shows the mapping and names its evidence; it never guesses.
+- **REMOVE** deletes what the card installed, keeping files you changed.
 
-Cards fill the available window in a multi-row grid. Every record has either
-established catalogue artwork or a deterministic title-and-system cover.
+## Set up
 
-## From clone to playable installation
-
-Git contains the reviewable source, catalogues, evidence, tools, metadata, and
-redistributable artwork. It does **not** contain the roughly 5 GB runtime or the
-generated `RetroPort.exe` and `RetroPort-Linux` launchers.
-
-On Debian or Ubuntu Linux, this builds both launchers, downloads every pinned
-runtime from its official source, verifies it, assembles the installation, and
-tests the result:
+Git holds the source, catalogues, tools, and artwork, not the ~5 GB runtime.
+On Debian or Ubuntu:
 
 ```sh
-sudo apt-get update
 sudo apt-get install -y build-essential curl git p7zip-full python3 rsync wine64
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 . "$HOME/.cargo/env"
 git clone https://github.com/muradkant/retrobat-portable.git
-cd retrobat-portable
-./tools/bootstrap_bundle.sh
+cd retrobat-portable && ./tools/bootstrap_bundle.sh
 ```
 
-The bootstrap is idempotent. It needs about 7 GB beyond Cargo's build cache and
-ends by printing the paths of both launchers. A raw clone without those files
-has not been assembled. See [Dependencies](DEPENDENCIES.md) for the inclusion
-boundary, cache control, pinned artifacts, and independent build stages.
+The bootstrap downloads every runtime from its official release, refuses any
+file whose SHA-256 differs from its pin, builds both launchers, and verifies
+the result (about 7 GB; cached; `RETROPORT_DOWNLOAD_CACHE` moves the cache).
+Then run `RetroPort.exe` on Windows or `./RetroPort-Linux` on Linux.
 
 ## Play
 
-On Windows, open the assembled folder and double-click `RetroPort.exe`.
+- Import a game made of many files (PS3, PS4, Wii U, PC, homebrew) as a folder.
+  CUE, GDI, and M3U imports bring every track. RAR and 7z archives unpack as
+  they are (Linux needs `p7zip-rar` for RAR). Arcade games import as the intact
+  MAME ROM-set ZIP.
+- Imports never overwrite a file RetroPort does not own; a taken name gets its
+  own `Title (2)` folder.
+- On Linux the first Wine-based PLAY prepares a Wine prefix (about a minute)
+  and installs Wine Mono from Wine's cache, or says exactly what to install.
+- Connect controllers before PLAY.
 
-On Linux, double-click `RetroPort-Linux.desktop` or run:
+## Emulators
 
-```sh
-./RetroPort-Linux
-```
+| System | Emulator |
+|---|---|
+| NES, SNES, Game Boy / Color, GBA, DS, 3DS | Mesen, bsnes, SameBoy, mGBA, melonDS, Azahar |
+| N64, GameCube / Wii, Wii U, Switch | Mupen64Plus-Next, Dolphin, Cemu, Eden |
+| PS1, PS2 | Beetle PSX HW, PCSX2 with your BIOS; PCSX ReARMed, Play! until then |
+| PS3, PS4, PSP, PS Vita | RPCS3, shadPS4, PPSSPP, Vita3K |
+| Xbox, Xbox 360 | xemu with your BIOS, Cxbx-Reloaded until then; Xenia Canary |
+| Mega Drive / Sega CD, Saturn, Dreamcast | Genesis Plus GX; Beetle Saturn (YabaSanshiro with `saturn_bios.bin`); Flycast |
+| Arcade, DOS, PC Engine, Amiga | MAME, DOSBox Pure, Beetle PCE, PUAE |
 
-Then:
+Standalone emulators are pinned releases with native Linux builds where they
+exist; RetroPort turns off the update checks of Cemu, RPCS3, PCSX2, xemu, and
+Vita3K. Systems whose emulator is not installed say so and offer neither PLAY
+nor DOWNLOAD.
 
-1. Browse **FEATURED**, a source, or a system—or search globally.
-2. Choose **DOWNLOAD** or **IMPORT GAME**.
-3. Choose **PLAY**.
+## Firmware
 
-Import extracted PS3, PS4, Wii U, and PC games with **IMPORT THIS FOLDER** so
-their executables, libraries, and data stay together. RAR archives can be
-selected directly and are unpacked into the managed game import. Import an
-arcade set such as `mspacman.zip` as the original ZIP, not as its extracted
-component files.
+RetroPort uses official firmware: from the maker where the maker publishes it,
+otherwise dumped from your own console. Your file always takes over from a
+built-in stand-in. Each card names the file, why it is needed, and where it
+comes from.
 
-An imported card adds **REMOVE** beside its ready actions. Removal deletes files
-that still match the import record, preserves anything modified afterward, and
-returns the card to **IMPORT GAME**.
+| Source | Systems |
+|---|---|
+| Sony, free: **INSTALL FIRMWARE** downloads, verifies, installs | PS3 system software; PS Vita system software and fonts |
+| Your console, switches to the reference emulator | PS1 → Beetle PSX; PS2 → PCSX2; Xbox (MCPX + flash) → xemu |
+| Your console, required | Saturn (`mpr-17933.bin`/`sega_101.bin`, or `saturn_bios.bin`), Sega CD (`bios_CD_U/E/J.bin`), PC Engine CD (`syscard3.pce`), Neo Geo (`neogeo.zip`), Neo Geo CD, 3DO, FDS (`disksys.rom`), 64DD (`IPL.n64`), Lynx, ColecoVision, Intellivision, Atari ST (`tos.img`), X68000, Switch (`prod.keys`) |
+| Optional, built-in stand-in otherwise | Dreamcast, GBA, DS, Atari 5200; Amiga (Kickstart, sold by [Cloanto](https://www.amigaforever.com/)) |
 
-**PLAY** becomes **LOADING**, then **TERMINATE**. This prevents duplicate
-launches; **TERMINATE** stops the emulator's complete process tree. Readiness
-audits and process monitoring run off the GUI thread, so importing or closing a
-game does not freeze the library.
+To plug files in, use **IMPORT FIRMWARE** on a card. Pick a file for a
+target, or press **RECOGNISE EVERY BIOS IN THIS FOLDER** (or drop a folder);
+RetroPort identifies each file by fingerprint and places it wherever its
+emulators look. From a terminal: `--import-firmware <file-or-folder>` and
+`--install-firmware ps3|psvita`. Every placed file's SHA-256 and origin are
+recorded; nothing you select is rejected.
 
-### Controllers
+Encrypted Wii U discs (`.wud`/`.wux`) need their disc keys, and encrypted 3DS
+dumps need decrypting on your console; decrypted dumps need nothing.
 
-Connect the controller before **PLAY**. **CONTROLS** reads the installed
-RetroArch/RetroBat mapping and the matching SDL device profile. Arcade entries
-add MAME-declared players, coins, controls, buttons, and special devices;
-RetroBat-tagged entries add exact gun, wheel, spinner, and trackball needs. If a
-core reveals action labels only at runtime, RetroPort directs the reader to
-RetroArch's Quick Menu → Controls rather than guessing.
+## Catalogue
 
-This evidence exists independently of the ROM bytes, so **CONTROLS** remains
-available before import. ZIP and RAR containers for the same catalogue game
-therefore resolve to the same guidance.
+- 80,734 records from 10 established sources, each with a cover, import route,
+  and controls view.
+- 4,153 downloadable records: 4,127 pinned to the publisher's exact file and
+  checked to end in a format their system plays; 26 say why they cannot be.
+- 76,581 commercial records you import from your own copies.
+- FEATURED: 410 titles found on six or more best-of lists or in the World
+  Video Game Hall of Fame.
 
-On Linux, RetroPort also understands the optional
-[`linux-zhixu-controller-fix` game guard](https://github.com/muradkant/linux-zhixu-controller-fix#tested-machine-circumstance).
-It suspends that project's controller-as-mouse mapping for the life of the
-emulator process tree, then restores desktop navigation. Without the guard,
-this integration is a no-op.
-
-### Firmware
-
-RetroPort uses established firmware-free routes where available: Play! for
-PS2, YabaSanshiro for Saturn, and Cxbx-Reloaded for original Xbox. A route that
-does need machine data exposes one of two actions:
-
-- **INSTALL FIRMWARE** downloads publisher-hosted bytes, verifies their size
-  and SHA-256, and opens the emulator installer. PS3 system software uses this
-  route.
-- **IMPORT FIRMWARE** accepts any nonempty user-selected file. RetroPort records
-  its hash for diagnosis but does not reject an unfamiliar dump. Switch
-  `prod.keys` are copied into both Eden profiles.
-
-Optional firmware follows the same rules. A documented built-in fallback does
-not produce a false firmware warning.
-
-## Catalogue coverage
-
-The checked-in snapshot contains:
-
-- **80,734** records from **10** established catalogue sources;
-- **4,153** complete direct-download or local-import routes;
-- **410** evidence-backed celebrated titles spanning **935** platform editions;
-- **80,734 / 80,734** covers, import routes, and controls views;
-- MAME machine associations for all **15,605** MAME records, with current input
-  declarations for **14,845** and explicit labels for historical names.
-
-**FEATURED** combines titles found on at least six independent editorial
-best-of lists with World Video Game Hall of Fame inductees. **ALL SOURCES**
-exposes the full snapshot. Generators and pins live in [`tools/`](tools/);
-generated catalogue and evidence snapshots live in [`catalog/`](catalog/).
-
-## Installation boundary
-
-An assembled installation is one independent directory:
+## Installation
 
 ```text
 RetroPort/
-├── RetroPort.exe                 # Windows GUI
-├── RetroPort-Linux               # Linux GUI
-├── RetroPort-Linux.desktop
-├── RetroBat/                     # adapters, emulators, games, saves
-├── Runtime/Linux/                # native modern-console AppImages
-├── Artwork/                      # verified local MAME artwork
-├── .retrobat-portable/           # imports, installs, cache, native state
-├── Source/RetroPort-source.zip   # corresponding source
-├── SHA256SUMS
-├── VERIFY-LINUX.sh
-├── VERIFY-WINDOWS.cmd
-└── README-FIRST.txt
+├── RetroPort.exe, RetroPort-Linux(.desktop)
+├── RetroBat/            emulators, games, saves, BIOS
+├── Runtime/Linux/       native AppImages
+├── Artwork/             bundled MAME artwork
+├── .retrobat-portable/  import and firmware records, logs, native state
+├── Source/RetroPort-source.zip
+└── SHA256SUMS, VERIFY-LINUX.sh, VERIFY-WINDOWS.cmd, README-FIRST.txt
 ```
 
-Each launcher resolves only this directory. It never borrows games,
-configuration, or runtimes from a sibling installation. Keep the launchers
-inside it. On Linux, only Wine's symlink-heavy prefix lives in user data;
-emulator configuration, native XDG state, artwork, games, saves, and manifests
-remain here.
+It is self-contained: nothing is borrowed from another installation. On Linux
+only the Wine prefix lives outside it (`~/.local/share/retrobat-portable/`).
 
-RPCS3, Cemu, shadPS4, Eden, and Xenia use native Linux runtimes. The legacy
-RetroBat stack uses 64-bit Wine.
+What RetroPort guarantees:
 
-## Verify or develop
+- Downloads come only from pinned publisher URLs and enter staging; bytes that
+  do not match are deleted. Archive members are found by hash, not name.
+- Imports reject traversal and symlinks, never overwrite unowned files, and
+  record every file they own. REMOVE deletes only files still matching their
+  record.
+- Folder names RetroPort creates are ASCII, so emulators that use Windows'
+  ANSI file API can open them.
+- Xbox disc images are unpacked by RetroPort for Cxbx (RetroBat would need the
+  Dokan driver); gzipped PS2 images are decompressed for Play!; Vita packages
+  are installed into Vita3K by title ID.
+- A launch that fails, including one EmulatorLauncher refuses, is reported with
+  its reason and log.
+- `SHA256SUMS` covers launchers, source, documentation, emulator binaries, and
+  artwork; games, saves, BIOS, and emulator state are yours and outside it.
 
-Verify an assembled Linux installation with `./VERIFY-LINUX.sh`; on Windows,
-double-click `VERIFY-WINDOWS.cmd`. Both compare launchers, source,
-documentation, runtimes, backends, and artwork with `SHA256SUMS`. The GUI
-self-check separately validates catalogue schemas, identifiers, counts, and
-coverage.
-
-The repository pins Rust 1.92.0. Verify a source checkout with:
-
-```sh
-cargo fmt --check
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo run -- --self-check --bundle-root "$PWD"
-```
-
-The live upstream test performs network I/O and is therefore explicit:
+## Verify and develop
 
 ```sh
-cargo test --test live_source -- --ignored
-```
-
-Build both release launchers on Linux with:
-
-```sh
-cargo build --release --target x86_64-unknown-linux-gnu
+./VERIFY-LINUX.sh                      # or VERIFY-WINDOWS.cmd: integrity
+./RetroPort-Linux --self-check         # catalogue, pins, coverage, artwork
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --all-targets
 cargo xwin build --release --target x86_64-pc-windows-msvc
+./tools/functional_test.sh             # real downloads, imports, and PLAY
 ```
 
-`cargo-xwin` uses Microsoft's public CRT/SDK packages; the resulting GUI binary
-links the static C runtime and opens no console. On a Windows MSVC host, use
-ordinary `cargo build --release`.
+The functional suite drives the real binary against private copies of the
+installation. It downloads and plays one game per recipe, content-folder
+games, and commercial demo discs. It imports homebrew for every system family,
+installs Sony's Vita firmware and plays a Vita game, checks the reference
+emulators, and runs the Windows build under Wine through its own PLAY routes. It needs Xvfb, ffmpeg,
+7-Zip, curl, and Wine, and uses its own Wine prefix. In that virtual display,
+Wine's OpenGL and Direct3D render in software, so PS2 and Xbox tests check that
+the game ran, not its picture.
 
-For source-machine menu integration, `tools/run_latest_linux.sh` rebuilds the
-current checkout before launch and rejects an incomplete local runtime. To
-exercise a real imported game beyond compositor timeout thresholds:
-
-```sh
-cargo run --release -- \
-  --bundle-root "$PWD" \
-  --gameplay-probe CATALOG_ID \
-  --gameplay-probe-output /tmp/retroport-gameplay.jsonl \
-  --gameplay-probe-seconds 20
-```
-
-This records launch, sustained execution, whole-tree termination, and exit.
-Maintainers with one complete installation can synchronize it elsewhere with
-`./tools/deploy_bundle.sh /destination`; normal clean-clone setup uses
-`bootstrap_bundle.sh`.
+- `--gameplay-probe ID` plays an installed card, captures RetroArch's frame,
+  and exits non-zero on any failure (`--help` lists every option).
+- `tools/build_download_ledger.py [--refresh SOURCE]` regenerates the download
+  pins.
+- `tools/deploy_bundle.sh DEST` updates another installation, replacing only
+  files in `SHA256SUMS`.
 
 ## Provenance
 
-RetroPort was built against these exact RetroBat revisions:
-
-| Project | Revision | Role |
-| --- | --- | --- |
-| [RetroBat](https://github.com/RetroBat-Official/retrobat) | `c90884f56f278dc943e898d8f47376e9ea27fb52` | Configuration, templates, updater, emulator matrix |
-| [EmulatorLauncher](https://github.com/RetroBat-Official/emulatorlauncher) | `1a9571af3411333cefd196b6c2ce3dc460bf8d88` | Per-system commands and input integration |
-| [EmulationStation](https://github.com/RetroBat-Official/emulationstation) | `d77fbf1fb198a10bb44221e40e463e2e2c30f1a7` | Established library frontend retained in the runtime |
-
-Execution comes from [RetroArch](https://github.com/libretro/RetroArch),
-[JAXE](https://github.com/kurtjd/jaxe),
-[Xenia Canary](https://github.com/xenia-canary/xenia-canary),
-[RPCS3](https://github.com/RPCS3/rpcs3),
-[Cemu](https://github.com/cemu-project/Cemu),
-[shadPS4](https://github.com/shadps4-emu/shadPS4),
-[Eden](https://git.eden-emu.dev/eden-emu/eden),
-[Cxbx-Reloaded](https://github.com/Cxbx-Reloaded/Cxbx-Reloaded), and
-[Play!](https://github.com/jpd002/Play-). Their notices remain with their
-runtimes.
-
-Controls evidence comes from [MAME `-listxml`](https://docs.mamedev.org/commandline/commandline-all.html),
-the [Libretro MAME DAT](https://github.com/libretro/libretro-database/tree/master/metadat/mame),
-RetroBat's pinned [`gamesdb.xml`](https://github.com/RetroBat-Official/emulationstation/blob/d77fbf1fb198a10bb44221e40e463e2e2c30f1a7/resources/gamesdb.xml),
-and Libretro's [RetroPad model](https://docs.libretro.com/guides/input-and-controls/).
-
-Catalogue and artwork sources are [Libretro Database](https://github.com/libretro/libretro-database),
-[Libretro Thumbnails](https://thumbnails.libretro.com/),
-[LaunchBox Games Database](https://gamesdb.launchbox-app.com/),
-[Homebrew Hub](https://hh.gbdev.io/), [RetroBat free content](https://wiki.retrobat.org/navigation/main-menu),
-[ScummVM freeware](https://www.scummvm.org/games/),
-[FreeDOS](https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/repositories/1.4/),
-[MAME-authorized ROMs](https://www.mamedev.org/roms/),
-[MSXdev](https://www.msxdev.org/msxdev-archive/),
-[Libretro Content Downloader](https://buildbot.libretro.com/assets/cores/),
-[DOS Games Archive](https://www.dosgamesarchive.com/), and
-[Progetto-SNAPS](https://www.progettosnaps.net/snapshots/). Featured evidence
-comes from the [critical-consensus list](https://en.wikipedia.org/wiki/List_of_video_games_listed_among_the_best)
-and [World Video Game Hall of Fame](https://www.museumofplay.org/exhibits/world-video-game-hall-of-fame/inducted-games/).
-
-[Architecture](ARCHITECTURE.md) defines runtime and trust invariants.
-[Dependencies](DEPENDENCIES.md) explains reproducible assembly.
-[`THIRD-PARTY-ASSETS.txt`](packaging/THIRD-PARTY-ASSETS.txt) records exact URLs,
-versions, hashes, and licences.
+Built against RetroBat [`c90884f`](https://github.com/RetroBat-Official/retrobat),
+EmulatorLauncher [`1a9571a`](https://github.com/RetroBat-Official/emulatorlauncher),
+and EmulationStation [`d77fbf1`](https://github.com/RetroBat-Official/emulationstation).
+Catalogue and artwork come from Libretro, LaunchBox, Homebrew Hub, RetroBat,
+ScummVM, FreeDOS, MAMEdev, MSXdev, DOS Games Archive, and Progetto-SNAPS.
+Controls evidence comes from MAME `-listxml`, the Libretro MAME DAT, and
+RetroBat's `gamesdb.xml`. [`THIRD-PARTY-ASSETS.txt`](packaging/THIRD-PARTY-ASSETS.txt)
+records every runtime's URL, version, hash, and licence.
