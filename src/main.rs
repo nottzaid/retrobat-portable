@@ -701,7 +701,7 @@ fn load_library(layout: &PortableLayout) -> LoadedLibrary {
                 entry.tags.join(" "),
                 entry.kind,
             )
-            .to_ascii_lowercase()
+            .to_lowercase()
         })
         .collect();
     let featured_ids = FeaturedCatalog::built_in(&browse)
@@ -855,55 +855,63 @@ impl PortableApp {
         let key = BrowseViewKey {
             source: self.source_filter.clone(),
             system: self.system_filter.clone(),
-            query: self.search.trim().to_ascii_lowercase(),
+            query: self.search.trim().to_lowercase(),
         };
         if self.browse_view_key.as_ref() == Some(&key) {
             return;
         }
-
+        let in_collection = |entry: &BrowseEntry| {
+            key.source == "all"
+                || (key.source == "featured" && self.featured_ids.contains(&entry.id))
+                || entry.source_id == key.source
+        };
         self.browse_systems = self
             .browse
             .entries
             .iter()
-            .filter(|entry| {
-                key.source == "all"
-                    || (key.source == "featured" && self.featured_ids.contains(&entry.id))
-                    || entry.source_id == key.source
-            })
+            .filter(|entry| in_collection(entry))
             .map(|entry| entry.system.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
 
-        self.browse_matches = self
-            .browse
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(index, entry)| {
-                if !key.query.is_empty() {
-                    // Search is intentionally global and ignores collection/system filters.
-                    self.search_documents[*index].contains(&key.query)
-                } else {
-                    let collection_matches = key.source == "all"
-                        || (key.source == "featured" && self.featured_ids.contains(&entry.id))
-                        || entry.source_id == key.source;
-                    let system_matches = key.system == "all" || entry.system == key.system;
-                    collection_matches && system_matches
-                }
-            })
-            .map(|(index, _)| index)
-            .collect();
-        if !key.query.is_empty() {
-            self.browse_matches.sort_by_cached_key(|index| {
-                let entry = &self.browse.entries[*index];
-                (
-                    !self.imported_ids.contains(&entry.id),
-                    entry.title.to_ascii_lowercase() != key.query,
-                    entry.title.to_ascii_lowercase(),
-                    entry.system.clone(),
-                )
-            });
+        if key.query.is_empty() {
+            self.browse_matches = self
+                .browse
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    in_collection(entry) && (key.system == "all" || entry.system == key.system)
+                })
+                .map(|(index, _)| index)
+                .collect();
+        } else {
+            // Search is intentionally global and ignores collection/system
+            // filters. Every word must appear somewhere in the record.
+            let terms = key.query.split_whitespace().collect::<Vec<_>>();
+            let mut ranked = self
+                .search_documents
+                .iter()
+                .enumerate()
+                .filter(|(_, document)| terms.iter().all(|term| document.contains(term)))
+                .map(|(index, _)| {
+                    let entry = &self.browse.entries[index];
+                    let title = entry.title.to_lowercase();
+                    let tier = if title == key.query {
+                        0
+                    } else if title.starts_with(&key.query) {
+                        1
+                    } else if terms.iter().all(|term| title.contains(term)) {
+                        2
+                    } else {
+                        3
+                    };
+                    (tier, !self.imported_ids.contains(&entry.id), title, index)
+                })
+                .collect::<Vec<_>>();
+            ranked.sort_unstable();
+            self.browse_matches = ranked.into_iter().map(|(_, _, _, index)| index).collect();
         }
         self.browse_view_key = Some(key);
     }

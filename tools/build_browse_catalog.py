@@ -50,22 +50,34 @@ class Fetcher:
         )
         return body
 
-    def text(self, url: str, source_id: str) -> str:
-        body = self.get(url, source_id)
-        encoding = requests.utils.get_encoding_from_headers(
-            self.session.get(url, timeout=TIMEOUT, stream=True).headers
-        )
-        return body.decode(encoding or "utf-8", errors="replace")
-
     def composite_hash(self, source_id: str) -> str:
         records = sorted(self.hashes.get(source_id, []))
         return hashlib.sha256("\n".join(records).encode()).hexdigest()
 
 
+def repair_mojibake(value: str) -> str:
+    """Undo UTF-8 that an upstream record stored after decoding it as
+    Latin-1 or Windows-1252, possibly more than once ("DoppelgÃ¤nger").
+    Text that does not decode back to valid UTF-8 is left exactly as is."""
+    while any(ord(character) > 127 for character in value):
+        for codec in ("latin-1", "cp1252"):
+            try:
+                repaired = value.encode(codec).decode("utf-8")
+                break
+            except UnicodeError:
+                continue
+        else:
+            return value
+        if repaired == value:
+            return value
+        value = repaired
+    return value
+
+
 def clean(value: str | None) -> str:
     if not value:
         return ""
-    return " ".join(html.unescape(value).split())
+    return " ".join(repair_mojibake(html.unescape(value)).split())
 
 
 def slug(value: str) -> str:
