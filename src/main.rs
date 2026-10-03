@@ -13,12 +13,11 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use retrobat_portable::artwork::{load_bundled_artwork, load_or_fetch, load_snapshot_artwork};
-use retrobat_portable::browse::{
-    Acquisition, BrowseCatalog, BrowseEntry, BundledArtwork, InstallState,
-};
-use retrobat_portable::browse_install::{BrowseInstaller, supports_direct_download};
+use retrobat_portable::browse::{Acquisition, BrowseCatalog, BrowseEntry, BundledArtwork};
+use retrobat_portable::browse_install::{BrowseInstaller, download_route};
 use retrobat_portable::catalog::{Artwork, Catalog, CatalogEntry};
 use retrobat_portable::controls::{ControlsCatalog, GameControls};
+use retrobat_portable::downloads::PinnedDownload;
 use retrobat_portable::featured::FeaturedCatalog;
 use retrobat_portable::firmware::{import_firmware, install_official_firmware};
 use retrobat_portable::import::{
@@ -472,8 +471,29 @@ struct LoadedLibrary {
     featured_ids: HashSet<String>,
     search_documents: Vec<String>,
     imported_manifests: BTreeMap<String, ImportedManifest>,
+    installed_ids: HashSet<String>,
     controls: ControlsCatalog,
     status: String,
+}
+
+/// Something a card asked for; performed after the page is drawn.
+enum CardAction {
+    Import(BrowseEntry),
+    Download(BrowseEntry),
+    Firmware(SystemReadiness),
+    Controls(BrowseEntry),
+    Remove {
+        catalog_id: String,
+        title: String,
+    },
+    Uninstall(CatalogEntry),
+    Terminate,
+    Play {
+        catalog_id: String,
+        title: String,
+        system: String,
+        rom: PathBuf,
+    },
 }
 
 struct OperationResult {
@@ -661,6 +681,8 @@ struct PortableApp {
     featured_ids: HashSet<String>,
     search_documents: Vec<String>,
     imported_manifests: BTreeMap<String, ImportedManifest>,
+    /// Trusted-catalogue installs made by earlier versions (PLAY + REMOVE).
+    installed_ids: HashSet<String>,
     retrobat_present: bool,
     controls: Option<ControlsCatalog>,
     browse_view_key: Option<BrowseViewKey>,
@@ -749,6 +771,7 @@ fn load_library(layout: &PortableLayout) -> LoadedLibrary {
             HashSet::new()
         });
     let imported_manifests = imported_manifests(layout);
+    let installed_ids = installed_trusted_ids(layout, &catalog);
     LoadedLibrary {
         catalog,
         browse,
@@ -756,9 +779,19 @@ fn load_library(layout: &PortableLayout) -> LoadedLibrary {
         featured_ids,
         search_documents,
         imported_manifests,
+        installed_ids,
         controls: ControlsCatalog::built_in().expect("built-in controls snapshot must validate"),
         status,
     }
+}
+
+fn installed_trusted_ids(layout: &PortableLayout, catalog: &Catalog) -> HashSet<String> {
+    catalog
+        .entries
+        .iter()
+        .filter(|entry| is_installed(layout, entry))
+        .map(|entry| entry.id.clone())
+        .collect()
 }
 
 impl PortableApp {
@@ -828,6 +861,7 @@ impl PortableApp {
             featured_ids: HashSet::new(),
             search_documents: Vec::new(),
             imported_manifests: BTreeMap::new(),
+            installed_ids: HashSet::new(),
             retrobat_present: layout.retrobat_executable().is_file(),
             controls: None,
             browse_view_key: None,
@@ -940,31 +974,365 @@ impl PortableApp {
         self.browse_view_key = Some(key);
     }
 
-    fn start_install(&mut self, entry: CatalogEntry) {
+    /// Draws one catalogue card, collecting what the user asked for into
+    /// `actions`. Returns the artwork request when its cover is not loaded.
+    fn card(
+        &self,
+        ui: &mut egui::Ui,
+        entry: &BrowseEntry,
+        card_width: f32,
+        artwork_height: f32,
+        actions: &mut Vec<CardAction>,
+    ) -> Option<(String, ArtworkSource)> {
+        const CARD: egui::Color32 = egui::Color32::from_rgb(22, 27, 38);
+        const GOOD: egui::Color32 = egui::Color32::from_rgb(98, 211, 145);
+        const WARN: egui::Color32 = egui::Color32::from_rgb(238, 177, 89);
+        const BAD: egui::Color32 = egui::Color32::from_rgb(235, 113, 113);
+        let mut artwork_request = None;
+        egui::Frame::new()
+            .fill(CARD)
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(43, 51, 69)))
+            .corner_radius(10)
+            .inner_margin(10)
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.set_min_width(card_width);
+                    ui.set_max_width(card_width);
+                    let size = egui::vec2(card_width, artwork_height);
+                    if let Some(texture) = self.textures.get(&entry.id) {
+                        ui.add(
+                            egui::Image::new((texture.id(), size))
+                                .fit_to_exact_size(size)
+                                .corner_radius(7),
+                        );
+                    } else {
+                        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                        let sourced = entry.artwork_asset.is_some() || entry.artwork_url.is_some();
+                        let failed = self.artwork_errors.contains_key(&entry.id);
+                        if sourced && !failed {
+                            ui.painter().rect_filled(rect, 7, egui::Color32::from_rgb(28, 35, 49));
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "LOADING…",
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::from_gray(130),
+                            );
+                            if !self.artwork_inflight.contains(&entry.id) {
+                                let source = self
+                                    .catalog
+                                    .entries
+                                    .iter()
+                                    .find(|trusted| trusted.id == entry.id)
+                                    .and_then(|trusted| trusted.artwork.first().cloned())
+                                    .map(ArtworkSource::Verified)
+                                    .or_else(|| entry.artwork_asset.clone().map(ArtworkSource::Bundled))
+                                    .or_else(|| entry.artwork_url.clone().map(ArtworkSource::Snapshot));
+                                artwork_request = source.map(|source| (entry.id.clone(), source));
+                            }
+                        } else {
+                            paint_generated_artwork(ui.painter(), rect, entry);
+                        }
+                    }
+                    ui.add_space(5.0);
+                    ui.label(egui::RichText::new(&entry.title).strong().color(egui::Color32::WHITE))
+                        .on_hover_text(format!("Card ID: {}", entry.id));
+                    let source_name = self
+                        .browse
+                        .sources
+                        .iter()
+                        .find(|source| source.id == entry.source_id)
+                        .map_or(entry.source_id.as_str(), |source| source.name.as_str());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}  ·  {}{}",
+                            entry.system.to_ascii_uppercase(),
+                            source_name,
+                            entry
+                                .release_year
+                                .map(|year| format!("  ·  {year}"))
+                                .unwrap_or_default()
+                        ))
+                        .small()
+                        .color(egui::Color32::from_gray(145)),
+                    );
+                    ui.label(
+                        egui::RichText::new(&entry.developer)
+                            .small()
+                            .color(egui::Color32::from_gray(165)),
+                    );
+                    if let Some(license) = &entry.license {
+                        ui.label(egui::RichText::new(license).small().color(egui::Color32::from_gray(125)));
+                    }
+                    let download = (entry.acquisition == Acquisition::DirectDownload)
+                        .then(|| download_route(entry));
+                    let (trust, trust_color, trust_detail) = match &download {
+                        Some(Ok(pinned)) => (
+                            "VERIFIED DOWNLOAD",
+                            GOOD,
+                            format!(
+                                "Fetched from {} and checked against its pinned SHA-256 ({}) before anything is installed.",
+                                pinned.url,
+                                format_import_size(pinned.size)
+                            ),
+                        ),
+                        Some(Err(reason)) => (
+                            "SOURCE UNAVAILABLE",
+                            egui::Color32::from_gray(145),
+                            format!("No verified download exists for this game: {reason}."),
+                        ),
+                        None => (
+                            "LOCAL COPY REQUIRED",
+                            egui::Color32::from_gray(145),
+                            "Import your own copy of this game.".to_owned(),
+                        ),
+                    };
+                    ui.label(egui::RichText::new(trust).small().strong().color(trust_color))
+                        .on_hover_text(trust_detail);
+                    if let Some(readiness) = self
+                        .readiness
+                        .as_ref()
+                        .and_then(|report| report.for_catalog_system(&entry.system))
+                    {
+                        let (label, color, detail) = match readiness.backend {
+                            BackendState::ReadyNow => (
+                                "BACKEND READY",
+                                GOOD,
+                                readiness.ready_route.as_ref().map_or_else(
+                                    || "An installed emulator route is available.".to_owned(),
+                                    |route| format!("Installed route: {}", route.label()),
+                                ),
+                            ),
+                            BackendState::ProvisionOnFirstPlay => (
+                                "EMULATOR SETUP ON FIRST PLAY",
+                                WARN,
+                                "RetroBat has a system adapter but no configured backend is installed yet. It may download one on first play.".to_owned(),
+                            ),
+                            BackendState::Unresolved => (
+                                "BACKEND NOT YET RESOLVED",
+                                BAD,
+                                "No RetroBat system adapter is currently mapped for this catalogue system.".to_owned(),
+                            ),
+                        };
+                        ui.label(egui::RichText::new(label).small().strong().color(color))
+                            .on_hover_text(detail);
+                        if readiness.firmware == FirmwareState::RequiredMissing {
+                            ui.label(egui::RichText::new("FIRMWARE SETUP REQUIRED").small().color(WARN))
+                                .on_hover_text(format!(
+                                    "The selected installed backend declares {} required firmware file(s); none were detected.",
+                                    readiness.firmware_candidates
+                                ));
+                        }
+                        if !readiness.firmware_files.is_empty() {
+                            let missing = |optional: bool| {
+                                readiness
+                                    .firmware_files
+                                    .iter()
+                                    .filter(|file| !file.present && file.optional == optional)
+                                    .collect::<Vec<_>>()
+                            };
+                            let (required, optional) = (missing(false), missing(true));
+                            let label = match (required.is_empty(), optional.is_empty()) {
+                                (false, _) if required.iter().any(|file| file.download.is_some()) => "INSTALL FIRMWARE",
+                                (false, _) => "IMPORT FIRMWARE",
+                                (true, false) if optional.iter().any(|file| file.download.is_some()) => {
+                                    "INSTALL OPTIONAL FIRMWARE"
+                                }
+                                (true, false) => "IMPORT OPTIONAL FIRMWARE",
+                                (true, true) => "MANAGE FIRMWARE",
+                            };
+                            if ui
+                                .add_enabled(
+                                    self.operation.is_none(),
+                                    egui::Button::new(egui::RichText::new(label).small().strong())
+                                        .fill(CONTROL_BACKGROUND),
+                                )
+                                .clicked()
+                            {
+                                actions.push(CardAction::Firmware(readiness.clone()));
+                            }
+                        }
+                    }
+                    if let Some(url) = &entry.detail_url {
+                        ui.hyperlink_to(egui::RichText::new("SOURCE DETAILS").small().color(ACCENT), url);
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("⌨  CONTROLS").small().strong())
+                                .fill(CONTROL_BACKGROUND)
+                                .min_size(egui::vec2(122.0, 26.0)),
+                        )
+                        .on_hover_text(
+                            "Available before import: guidance comes from the catalogue's MAME/RetroBat metadata and the installed RetroArch/controller configuration, not from inspecting ROM bytes.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(CardAction::Controls(entry.clone()));
+                    }
+                    ui.add_space(3.0);
+                    self.card_game_buttons(ui, entry, download.as_ref(), actions);
+                });
+            });
+        artwork_request
+    }
+
+    /// PLAY/TERMINATE, IMPORT GAME or DOWNLOAD, and REMOVE for one card.
+    fn card_game_buttons(
+        &self,
+        ui: &mut egui::Ui,
+        entry: &BrowseEntry,
+        download: Option<&Result<&'static PinnedDownload, String>>,
+        actions: &mut Vec<CardAction>,
+    ) {
+        let imported = self.imported_manifests.get(&entry.id);
+        let trusted = self
+            .catalog
+            .entries
+            .iter()
+            .find(|trusted| trusted.id == entry.id)
+            .filter(|trusted| self.installed_ids.contains(&trusted.id));
+        let playable = imported
+            .map(|manifest| {
+                (
+                    manifest.system.clone(),
+                    self.layout.root.join(&manifest.launch_relative_path),
+                )
+            })
+            .or_else(|| {
+                trusted.map(|trusted| {
+                    (
+                        trusted.system.clone(),
+                        self.layout.root.join(trusted.install_relative_path()),
+                    )
+                })
+            });
+        let busy = self.operation.is_some();
+        let (label, intent) = match &playable {
+            Some(_) => game_button_state(
+                self.running_game
+                    .as_ref()
+                    .map(|game| (game.catalog_id.as_str(), game.phase(), game.age())),
+                &entry.id,
+            ),
+            None => match download {
+                Some(Ok(_)) => ("DOWNLOAD".to_owned(), GameButtonIntent::Play),
+                Some(Err(_)) => ("UNAVAILABLE".to_owned(), GameButtonIntent::Disabled),
+                None => ("IMPORT GAME".to_owned(), GameButtonIntent::Play),
+            },
+        };
+        let wide = entry.acquisition == Acquisition::DirectDownload;
+        let width = if wide { 150.0 } else { 122.0 };
+        if ui
+            .add_enabled(
+                !busy && intent != GameButtonIntent::Disabled,
+                egui::Button::new(
+                    egui::RichText::new(&label)
+                        .small()
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(ACCENT)
+                .min_size(egui::vec2(width, 28.0)),
+            )
+            .clicked()
+        {
+            actions.push(match (intent, playable) {
+                (GameButtonIntent::Terminate, _) => CardAction::Terminate,
+                (_, Some((system, rom))) => CardAction::Play {
+                    catalog_id: entry.id.clone(),
+                    title: entry.title.clone(),
+                    system,
+                    rom,
+                },
+                (_, None) if download.is_some() => CardAction::Download(entry.clone()),
+                (_, None) => CardAction::Import(entry.clone()),
+            });
+        }
+        if imported.is_some() || trusted.is_some() {
+            let removable = remove_import_available(true, busy, self.running_game.is_some());
+            if ui
+                .add_enabled(
+                    removable,
+                    egui::Button::new(egui::RichText::new("REMOVE").small().strong())
+                        .fill(egui::Color32::from_rgb(113, 47, 55))
+                        .min_size(egui::vec2(width, 26.0)),
+                )
+                .on_hover_text(
+                    "Remove the files this card installed and return it to its first action. Files you changed since are kept.",
+                )
+                .clicked()
+            {
+                actions.push(match trusted {
+                    Some(trusted) if imported.is_none() => CardAction::Uninstall(trusted.clone()),
+                    _ => CardAction::Remove {
+                        catalog_id: entry.id.clone(),
+                        title: entry.title.clone(),
+                    },
+                });
+            }
+        }
+    }
+
+    fn perform(&mut self, action: CardAction) {
+        match action {
+            CardAction::Import(entry) => self.import_dialog = Some(ImportDialog::new(entry)),
+            CardAction::Download(entry) => self.start_browse_download(entry),
+            CardAction::Firmware(readiness) => {
+                self.firmware_dialog = Some(FirmwareDialog::new(&readiness));
+            }
+            CardAction::Controls(entry) => {
+                if let Some(controls) = &self.controls {
+                    let imported = self.imported_manifests.get(&entry.id);
+                    self.controls_dialog = Some(controls.for_game(
+                        &self.layout,
+                        &entry,
+                        imported,
+                        self.readiness.as_ref(),
+                    ));
+                }
+            }
+            CardAction::Remove { catalog_id, title } => self.start_remove_import(catalog_id, title),
+            CardAction::Uninstall(entry) => self.start_uninstall(entry),
+            CardAction::Terminate => self.terminate_running_game(),
+            CardAction::Play {
+                catalog_id,
+                title,
+                system,
+                rom,
+            } => self.launch_game(&catalog_id, &title, &system, &rom),
+        }
+    }
+
+    /// Removes a game an earlier RetroPort version installed through the
+    /// trusted catalogue (its record lives in .retrobat-portable/installed).
+    fn start_uninstall(&mut self, entry: CatalogEntry) {
         let layout = self.layout.clone();
         let (sender, receiver) = mpsc::channel();
         self.operation = Some(receiver);
-        self.status = format!("Downloading and verifying {}…", entry.title);
+        self.status = format!("Removing {}…", entry.title);
+        let context = self.context.clone();
         thread::spawn(move || {
             let result = ReqwestDownloader::new()
-                .and_then(|downloader| Installer::new(&layout, &downloader).install(&entry));
-            let result = match result {
+                .and_then(|downloader| Installer::new(&layout, &downloader).uninstall(&entry));
+            let _ = sender.send(match result {
                 Ok(report) => OperationResult {
                     success: true,
-                    heading: "INSTALL COMPLETE".to_owned(),
+                    heading: "GAME REMOVED".to_owned(),
                     message: format!(
-                        "Installed and verified {} bytes at {}.",
-                        report.bytes,
-                        report.destination.display()
+                        "Removed {}: {} owned file(s) deleted, {} modified file(s) preserved.",
+                        entry.title,
+                        report.removed.len(),
+                        report.preserved_modified.len()
                     ),
                 },
                 Err(error) => OperationResult {
                     success: false,
-                    heading: "INSTALL FAILED".to_owned(),
-                    message: format!("Install failed safely: {error}"),
+                    heading: "REMOVE FAILED".to_owned(),
+                    message: format!("Could not remove {}: {error}", entry.title),
                 },
-            };
-            let _ = sender.send(result);
+            });
+            context.request_repaint();
         });
     }
 
@@ -1216,7 +1584,7 @@ impl PortableApp {
         let (sender, receiver) = mpsc::channel();
         self.operation = Some(receiver);
         self.status = format!(
-            "Downloading {} from its immutable source snapshot…",
+            "Downloading {} from its publisher and verifying it…",
             entry.title
         );
         thread::spawn(move || {
@@ -1233,9 +1601,9 @@ impl PortableApp {
                     success: true,
                     heading: "DOWNLOAD COMPLETE — PLAY IS READY".to_owned(),
                     message: format!(
-                        "Downloaded and imported {title}: {} file(s), {} MiB. PLAY is ready.",
+                        "Downloaded, verified, and installed {title}: {} file(s), {}. PLAY is ready.",
                         report.import.imported_files,
-                        report.import.imported_bytes / (1024 * 1024)
+                        format_import_size(report.import.imported_bytes)
                     ),
                 },
                 Err(error) => OperationResult {
@@ -1921,10 +2289,16 @@ impl PortableApp {
             return;
         }
         let layout = self.layout.clone();
+        let preferred_core = self
+            .imported_manifests
+            .get(catalog_id)
+            .and_then(|manifest| manifest.core.clone());
         let backend = self
             .readiness
             .as_ref()
-            .and_then(|report| report.select_backend(system, rom))
+            .and_then(|report| {
+                report.select_backend_preferring(system, rom, preferred_core.as_deref())
+            })
             .cloned();
         let route_label = backend.as_ref().map(|route| route.label());
         let plan =
@@ -1979,6 +2353,7 @@ impl eframe::App for PortableApp {
             self.featured_ids = loaded.featured_ids;
             self.search_documents = loaded.search_documents;
             self.imported_manifests = loaded.imported_manifests;
+            self.installed_ids = loaded.installed_ids;
             self.controls = Some(loaded.controls);
             self.browse_view_key = None;
             self.browse_systems.clear();
@@ -2043,6 +2418,7 @@ impl eframe::App for PortableApp {
             self.operation_notice = Some(result);
             self.operation = None;
             self.imported_manifests = imported_manifests(&self.layout);
+            self.installed_ids = installed_trusted_ids(&self.layout, &self.catalog);
             self.retrobat_present = self.layout.retrobat_executable().is_file();
             self.browse_view_key = None;
             self.refresh_readiness();
@@ -2187,7 +2563,6 @@ impl eframe::App for PortableApp {
     }
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        const CARD: egui::Color32 = egui::Color32::from_rgb(22, 27, 38);
         let panel = egui::Frame::new()
             .fill(egui::Color32::from_rgb(13, 16, 23))
             .inner_margin(24);
@@ -2286,11 +2661,11 @@ impl eframe::App for PortableApp {
                         );
                         ui.label(
                             egui::RichText::new(format!(
-                                "{} TITLES  ·  {} SOURCES  ·  {} VERIFIED INSTALL{}",
+                                "{} TITLES  ·  {} SOURCES  ·  {} VERIFIED DOWNLOADS",
                                 self.browse.entries.len(),
                                 self.browse.sources.len(),
-                                self.catalog.entries.len(),
-                                if self.catalog.entries.len() == 1 { "" } else { "S" }
+                                retrobat_portable::browse_install::ledger()
+                                    .map_or(0, |ledger| ledger.entries.len())
                             ))
                             .small()
                             .color(egui::Color32::from_gray(145)),
@@ -2405,604 +2780,34 @@ impl eframe::App for PortableApp {
                     let match_count = self.browse_matches.len();
                     self.browse_page = self.browse_page.min(page_count - 1);
                     let page_start = self.browse_page * BROWSE_PAGE_SIZE;
-                    let page_entries: Vec<BrowseEntry> = self
+                    let page: Vec<usize> = self
                         .browse_matches
                         .iter()
                         .copied()
                         .skip(page_start)
                         .take(BROWSE_PAGE_SIZE)
-                        .map(|index| self.browse.entries[index].clone())
                         .collect();
-                    let mut artwork_requests = Vec::new();
-                    let mut requested_import = None;
-                    let mut requested_install = None;
-                    let mut requested_download = None;
-                    let mut requested_firmware = None;
-                    let mut requested_controls = None;
-                    let mut requested_remove_import = None;
-                    let mut requested_play: Option<(String, String, String, PathBuf)> = None;
-                    let mut requested_terminate = false;
-                    let layout = self.layout.clone();
-
                     let (grid_columns, card_width, grid_spacing) =
                         browse_grid_geometry(library_viewport_width);
                     let artwork_height = (card_width * 2.0 / 3.0).round();
+                    let mut actions = Vec::new();
+                    let mut artwork_requests = Vec::new();
                     egui::Grid::new("browse-card-grid")
                         .num_columns(grid_columns)
                         .spacing([grid_spacing, grid_spacing])
                         .show(ui, |ui| {
-                                for (card_index, entry) in page_entries.iter().enumerate() {
-                                    egui::Frame::new()
-                                        .fill(CARD)
-                                        .stroke(egui::Stroke::new(
-                                            1.0,
-                                            egui::Color32::from_rgb(43, 51, 69),
-                                        ))
-                                        .corner_radius(10)
-                                        .inner_margin(10)
-                                        .show(ui, |ui| {
-                                            ui.vertical(|ui| {
-                                                ui.set_min_width(card_width);
-                                                ui.set_max_width(card_width);
-                                                if let Some(texture) = self.textures.get(&entry.id)
-                                                {
-                                                    ui.add(
-                                                        egui::Image::new((
-                                                            texture.id(),
-                                                            egui::vec2(card_width, artwork_height),
-                                                        ))
-                                                        .fit_to_exact_size(egui::vec2(
-                                                            card_width,
-                                                            artwork_height,
-                                                        ))
-                                                        .corner_radius(7),
-                                                    );
-                                                } else {
-                                                    let (rect, _) = ui.allocate_exact_size(
-                                                        egui::vec2(card_width, artwork_height),
-                                                        egui::Sense::hover(),
-                                                    );
-                                                    let has_sourced_artwork = entry
-                                                        .artwork_asset
-                                                        .is_some()
-                                                        || entry.artwork_url.is_some();
-                                                    let failed = self
-                                                        .artwork_errors
-                                                        .contains_key(&entry.id);
-                                                    if has_sourced_artwork && !failed {
-                                                        ui.painter().rect_filled(
-                                                            rect,
-                                                            7,
-                                                            egui::Color32::from_rgb(28, 35, 49),
-                                                        );
-                                                        ui.painter().text(
-                                                            rect.center(),
-                                                            egui::Align2::CENTER_CENTER,
-                                                            "LOADING…",
-                                                            egui::FontId::proportional(12.0),
-                                                            egui::Color32::from_gray(130),
-                                                        );
-                                                    } else {
-                                                        paint_generated_artwork(
-                                                            ui.painter(),
-                                                            rect,
-                                                            entry,
-                                                        );
-                                                    }
-                                                    if has_sourced_artwork
-                                                        && !self
-                                                            .artwork_inflight
-                                                            .contains(&entry.id)
-                                                        && !failed
-                                                    {
-                                                        let source = self
-                                                            .catalog
-                                                            .entries
-                                                            .iter()
-                                                            .find(|trusted| trusted.id == entry.id)
-                                                            .and_then(|trusted| {
-                                                                trusted.artwork.first().cloned()
-                                                            })
-                                                            .map(ArtworkSource::Verified)
-                                                            .or_else(|| {
-                                                                entry
-                                                                    .artwork_asset
-                                                                    .clone()
-                                                                    .map(ArtworkSource::Bundled)
-                                                            })
-                                                            .or_else(|| {
-                                                                entry
-                                                                    .artwork_url
-                                                                    .clone()
-                                                                    .map(ArtworkSource::Snapshot)
-                                                            })
-                                                            .expect(
-                                                                "sourced artwork has a loader",
-                                                            );
-                                                        artwork_requests.push((
-                                                            entry.id.clone(),
-                                                            source,
-                                                        ));
-                                                    }
-                                                }
-                                                ui.add_space(5.0);
-                                                ui.label(
-                                                    egui::RichText::new(&entry.title)
-                                                        .strong()
-                                                        .color(egui::Color32::WHITE),
-                                                );
-                                                let source_name = self
-                                                    .browse
-                                                    .sources
-                                                    .iter()
-                                                    .find(|source| source.id == entry.source_id)
-                                                    .map(|source| source.name.as_str())
-                                                    .unwrap_or(&entry.source_id);
-                                                ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "{}  ·  {}{}",
-                                                        entry.system.to_ascii_uppercase(),
-                                                        source_name,
-                                                        entry
-                                                            .release_year
-                                                            .map(|year| format!("  ·  {year}"))
-                                                            .unwrap_or_default()
-                                                    ))
-                                                    .small()
-                                                    .color(egui::Color32::from_gray(145)),
-                                                );
-                                                ui.label(
-                                                    egui::RichText::new(&entry.developer)
-                                                        .small()
-                                                        .color(egui::Color32::from_gray(165)),
-                                                );
-                                                if let Some(license) = &entry.license {
-                                                    ui.label(
-                                                        egui::RichText::new(license)
-                                                            .small()
-                                                            .color(egui::Color32::from_gray(125)),
-                                                    );
-                                                }
-                                                let (trust, trust_color) = match (
-                                                    entry.acquisition,
-                                                    entry.install_state,
-                                                ) {
-                                                    (
-                                                        Acquisition::DirectDownload,
-                                                        InstallState::Verified,
-                                                    ) => (
-                                                        "VERIFIED DOWNLOAD",
-                                                        egui::Color32::from_rgb(98, 211, 145),
-                                                    ),
-                                                    (
-                                                        Acquisition::DirectDownload,
-                                                        InstallState::AuditRequired,
-                                                    ) => (
-                                                        "DIRECT DOWNLOAD",
-                                                        egui::Color32::from_rgb(238, 177, 89),
-                                                    ),
-                                                    (Acquisition::DirectDownload, _) => (
-                                                        "DIRECT DOWNLOAD",
-                                                        egui::Color32::from_gray(145),
-                                                    ),
-                                                    (Acquisition::LocalImport, _) => (
-                                                        "LOCAL COPY REQUIRED",
-                                                        egui::Color32::from_gray(145),
-                                                    ),
-                                                };
-                                                ui.label(
-                                                    egui::RichText::new(trust)
-                                                        .small()
-                                                        .strong()
-                                                        .color(trust_color),
-                                                );
-                                                if let Some(readiness) = self
-                                                    .readiness
-                                                    .as_ref()
-                                                    .and_then(|report| {
-                                                        report.for_catalog_system(&entry.system)
-                                                    })
-                                                {
-                                                    let (label, color, detail) = match readiness
-                                                        .backend
-                                                    {
-                                                        BackendState::ReadyNow => (
-                                                            "BACKEND READY",
-                                                            egui::Color32::from_rgb(98, 211, 145),
-                                                            readiness
-                                                                .ready_route
-                                                                .as_ref()
-                                                                .map(|route| {
-                                                                    format!(
-                                                                        "Installed route: {}",
-                                                                        route.label()
-                                                                    )
-                                                                })
-                                                                .unwrap_or_else(|| {
-                                                                    "An installed emulator route is available."
-                                                                        .to_owned()
-                                                                }),
-                                                        ),
-                                                        BackendState::ProvisionOnFirstPlay => (
-                                                            "EMULATOR SETUP ON FIRST PLAY",
-                                                            egui::Color32::from_rgb(238, 177, 89),
-                                                            "RetroBat has a system adapter but no configured backend is installed yet. It may download one on first play."
-                                                                .to_owned(),
-                                                        ),
-                                                        BackendState::Unresolved => (
-                                                            "BACKEND NOT YET RESOLVED",
-                                                            egui::Color32::from_rgb(235, 113, 113),
-                                                            "No RetroBat system adapter is currently mapped for this catalogue system."
-                                                                .to_owned(),
-                                                        ),
-                                                    };
-                                                    ui.label(
-                                                        egui::RichText::new(label)
-                                                            .small()
-                                                            .strong()
-                                                            .color(color),
-                                                    )
-                                                    .on_hover_text(detail);
-                                                    if readiness.firmware
-                                                        == FirmwareState::RequiredMissing
-                                                    {
-                                                        ui.label(
-                                                            egui::RichText::new(
-                                                                "FIRMWARE SETUP REQUIRED",
-                                                            )
-                                                            .small()
-                                                            .color(egui::Color32::from_rgb(
-                                                                238, 177, 89,
-                                                            )),
-                                                        )
-                                                        .on_hover_text(format!(
-                                                            "The selected installed backend declares {} required firmware file(s); none were detected.",
-                                                            readiness.firmware_candidates
-                                                        ));
-                                                    }
-                                                    let missing_required = readiness
-                                                        .firmware_files
-                                                        .iter()
-                                                        .any(|file| {
-                                                            !file.present && !file.optional
-                                                        });
-                                                    let missing_optional = readiness
-                                                        .firmware_files
-                                                        .iter()
-                                                        .any(|file| file.optional && !file.present);
-                                                    let downloadable_required = readiness
-                                                        .firmware_files
-                                                        .iter()
-                                                        .any(|file| {
-                                                            !file.present
-                                                                && !file.optional
-                                                                && file.download.is_some()
-                                                        });
-                                                    let downloadable_optional = readiness
-                                                        .firmware_files
-                                                        .iter()
-                                                        .any(|file| {
-                                                            !file.present
-                                                                && file.optional
-                                                                && file.download.is_some()
-                                                        });
-                                                    if !readiness.firmware_files.is_empty()
-                                                        && ui
-                                                            .add_enabled(
-                                                                self.operation.is_none(),
-                                                                egui::Button::new(
-                                                                    egui::RichText::new(
-                                                                        if missing_required {
-                                                                            if downloadable_required {
-                                                                                "INSTALL FIRMWARE"
-                                                                            } else {
-                                                                                "IMPORT FIRMWARE"
-                                                                            }
-                                                                        } else if missing_optional {
-                                                                            if downloadable_optional {
-                                                                                "INSTALL OPTIONAL FIRMWARE"
-                                                                            } else {
-                                                                                "IMPORT OPTIONAL FIRMWARE"
-                                                                            }
-                                                                        } else {
-                                                                            "MANAGE FIRMWARE"
-                                                                        },
-                                                                    )
-                                                                    .small()
-                                                                    .strong(),
-                                                                )
-                                                                .fill(CONTROL_BACKGROUND),
-                                                            )
-                                                            .clicked()
-                                                    {
-                                                        requested_firmware =
-                                                            Some(readiness.clone());
-                                                    }
-                                                }
-                                                if let Some(url) = &entry.detail_url {
-                                                    ui.hyperlink_to(
-                                                        egui::RichText::new("SOURCE DETAILS")
-                                                            .small()
-                                                            .color(ACCENT),
-                                                        url,
-                                                    );
-                                                }
-                                                ui.add_space(4.0);
-                                                if ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            egui::RichText::new("⌨  CONTROLS")
-                                                                .small()
-                                                                .strong(),
-                                                        )
-                                                        .fill(CONTROL_BACKGROUND)
-                                                        .min_size(egui::vec2(122.0, 26.0)),
-                                                    )
-                                                    .on_hover_text(
-                                                        "Available before import: guidance comes from the catalogue's MAME/RetroBat metadata and the installed RetroArch/controller configuration, not from inspecting ROM bytes.",
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    requested_controls = Some(entry.clone());
-                                                }
-                                                ui.add_space(3.0);
-                                                match entry.acquisition {
-                                                    Acquisition::LocalImport => {
-                                                        let imported = self
-                                                            .imported_manifests
-                                                            .get(&entry.id)
-                                                            .cloned();
-                                                        let imported_ready = imported.is_some();
-                                                        let (label, game_intent) = if imported
-                                                            .is_some()
-                                                        {
-                                                            game_button_state(
-                                                                self.running_game.as_ref().map(|game| (game.catalog_id.as_str(), game.phase(), game.age())),
-                                                                &entry.id,
-                                                            )
-                                                        } else {
-                                                            (
-                                                                "IMPORT GAME".to_owned(),
-                                                                GameButtonIntent::Play,
-                                                            )
-                                                        };
-                                                        if ui
-                                                            .add_enabled(
-                                                                self.operation.is_none()
-                                                                    && game_intent
-                                                                        != GameButtonIntent::Disabled,
-                                                                egui::Button::new(
-                                                                    egui::RichText::new(&label)
-                                                                        .small()
-                                                                        .strong()
-                                                                        .color(
-                                                                            egui::Color32::WHITE,
-                                                                        ),
-                                                                )
-                                                                .fill(ACCENT)
-                                                                .min_size(egui::vec2(122.0, 28.0)),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            if game_intent
-                                                                == GameButtonIntent::Terminate
-                                                            {
-                                                                requested_terminate = true;
-                                                            } else if let Some(manifest) = imported.clone() {
-                                                                requested_play = Some((
-                                                                    entry.id.clone(),
-                                                                    entry.title.clone(),
-                                                                    manifest.system,
-                                                                    layout.root.join(
-                                                                        manifest
-                                                                            .launch_relative_path,
-                                                                    ),
-                                                                ));
-                                                            } else {
-                                                                requested_import =
-                                                                    Some(entry.clone());
-                                                            }
-                                                        }
-                                                        if imported_ready
-                                                            && ui
-                                                                .add_enabled(
-                                                                    remove_import_available(
-                                                                        imported_ready,
-                                                                        self.operation.is_some(),
-                                                                        self.running_game.is_some(),
-                                                                    ),
-                                                                    egui::Button::new(
-                                                                        egui::RichText::new(
-                                                                            "REMOVE",
-                                                                        )
-                                                                        .small()
-                                                                        .strong(),
-                                                                    )
-                                                                    .fill(egui::Color32::from_rgb(
-                                                                        113, 47, 55,
-                                                                    ))
-                                                                    .min_size(egui::vec2(
-                                                                        122.0, 26.0,
-                                                                    )),
-                                                                )
-                                                                .on_hover_text(
-                                                                    "Remove files owned by this import and return the card to IMPORT GAME. Modified files are preserved.",
-                                                                )
-                                                                .clicked()
-                                                        {
-                                                            requested_remove_import = Some((
-                                                                entry.id.clone(),
-                                                                entry.title.clone(),
-                                                            ));
-                                                        }
-                                                    }
-                                                    Acquisition::DirectDownload => {
-                                                        let trusted = self
-                                                            .catalog
-                                                            .entries
-                                                            .iter()
-                                                            .find(|trusted| {
-                                                                trusted.id == entry.id
-                                                            });
-                                                        let installed = trusted.is_some_and(
-                                                            |trusted| {
-                                                                is_installed(&layout, trusted)
-                                                            },
-                                                        );
-                                                        let imported = self
-                                                            .imported_manifests
-                                                            .get(&entry.id)
-                                                            .cloned();
-                                                        let imported_ready = imported.is_some();
-                                                        let game_ready = installed
-                                                            || imported.is_some();
-                                                        let (label, game_intent) = if game_ready {
-                                                            game_button_state(
-                                                                self.running_game.as_ref().map(|game| (game.catalog_id.as_str(), game.phase(), game.age())),
-                                                                &entry.id,
-                                                            )
-                                                        } else {
-                                                            (
-                                                                "DOWNLOAD".to_owned(),
-                                                                GameButtonIntent::Play,
-                                                            )
-                                                        };
-                                                        if ui
-                                                            .add_enabled(
-                                                                self.operation.is_none()
-                                                                    && game_intent
-                                                                        != GameButtonIntent::Disabled
-                                                                    && (installed
-                                                                        || imported.is_some()
-                                                                        || trusted.is_some()
-                                                                        || supports_direct_download(
-                                                                            entry,
-                                                                        )),
-                                                                egui::Button::new(
-                                                                    egui::RichText::new(&label)
-                                                                        .small()
-                                                                        .strong()
-                                                                        .color(
-                                                                            egui::Color32::WHITE,
-                                                                        ),
-                                                                )
-                                                                .fill(ACCENT)
-                                                                .min_size(egui::vec2(150.0, 28.0)),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            if game_intent
-                                                                == GameButtonIntent::Terminate
-                                                            {
-                                                                requested_terminate = true;
-                                                            } else if installed {
-                                                                requested_play = Some((
-                                                                    entry.id.clone(),
-                                                                    entry.title.clone(),
-                                                                    trusted
-                                                                        .expect(
-                                                                            "installed entries are trusted",
-                                                                        )
-                                                                        .system
-                                                                        .clone(),
-                                                                    layout.root.join(
-                                                                        trusted
-                                                                            .expect(
-                                                                                "installed entries are trusted",
-                                                                            )
-                                                                            .install_relative_path(),
-                                                                        ),
-                                                                ));
-                                                            } else if let Some(manifest) = imported.clone() {
-                                                                requested_play = Some((
-                                                                    entry.id.clone(),
-                                                                    entry.title.clone(),
-                                                                    manifest.system,
-                                                                    layout.root.join(
-                                                                        manifest
-                                                                            .launch_relative_path,
-                                                                    ),
-                                                                ));
-                                                            } else if let Some(trusted) = trusted {
-                                                                requested_install =
-                                                                    Some(trusted.clone());
-                                                            } else if supports_direct_download(entry)
-                                                            {
-                                                                requested_download =
-                                                                    Some(entry.clone());
-                                                            }
-                                                        }
-                                                        if imported_ready
-                                                            && ui
-                                                                .add_enabled(
-                                                                    remove_import_available(
-                                                                        imported_ready,
-                                                                        self.operation.is_some(),
-                                                                        self.running_game.is_some(),
-                                                                    ),
-                                                                    egui::Button::new(
-                                                                        egui::RichText::new(
-                                                                            "REMOVE",
-                                                                        )
-                                                                        .small()
-                                                                        .strong(),
-                                                                    )
-                                                                    .fill(egui::Color32::from_rgb(
-                                                                        113, 47, 55,
-                                                                    ))
-                                                                    .min_size(egui::vec2(
-                                                                        150.0, 26.0,
-                                                                    )),
-                                                                )
-                                                                .on_hover_text(
-                                                                    "Remove files owned by this import. Modified files are preserved.",
-                                                                )
-                                                                .clicked()
-                                                        {
-                                                            requested_remove_import = Some((
-                                                                entry.id.clone(),
-                                                                entry.title.clone(),
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                        });
-                                    if (card_index + 1) % grid_columns == 0 {
-                                        ui.end_row();
-                                    }
+                            for (card_index, &entry_index) in page.iter().enumerate() {
+                                let entry = &self.browse.entries[entry_index];
+                                if let Some(request) = self.card(ui, entry, card_width, artwork_height, &mut actions) {
+                                    artwork_requests.push(request);
                                 }
+                                if (card_index + 1) % grid_columns == 0 {
+                                    ui.end_row();
+                                }
+                            }
                         });
-                    if let Some(entry) = requested_import {
-                        self.import_dialog = Some(ImportDialog::new(entry));
-                    }
-                    if let Some(entry) = requested_install {
-                        self.start_install(entry);
-                    }
-                    if let Some(entry) = requested_download {
-                        self.start_browse_download(entry);
-                    }
-                    if let Some(readiness) = requested_firmware {
-                        self.firmware_dialog = Some(FirmwareDialog::new(&readiness));
-                    }
-                    if let Some(entry) = requested_controls
-                        && let Some(controls) = &self.controls
-                    {
-                        let imported = self.imported_manifests.get(&entry.id);
-                        self.controls_dialog = Some(controls.for_game(
-&layout,
-&entry,
-imported,
-self.readiness.as_ref(),
-));
-                    }
-                    if let Some((catalog_id, title)) = requested_remove_import {
-                        self.start_remove_import(catalog_id, title);
-                    }
-                    if requested_terminate {
-                        self.terminate_running_game();
-                    } else if let Some((catalog_id, title, system, rom)) = requested_play {
-                        self.launch_game(&catalog_id, &title, &system, &rom);
+                    for action in actions {
+                        self.perform(action);
                     }
                     self.start_browse_artwork(artwork_requests);
 

@@ -65078,7 +65078,7 @@
       "source_id": "libretro-content",
       "title": "Cave Story (En)",
       "developer": "Community content authors",
-      "system": "ports",
+      "system": "cavestory",
       "kind": "game",
       "tags": [
         "Cave Story",

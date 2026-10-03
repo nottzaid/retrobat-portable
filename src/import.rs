@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(unix)]
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -60,6 +59,8 @@ pub enum ImportError {
     },
     #[error("the archive contains no files")]
     EmptyArchive,
+    #[error("the archive has no file matching the pinned game file")]
+    MissingArchiveMember,
     #[error("disc playlist or descriptor references an unsafe path: {0}")]
     UnsafeReference(PathBuf),
     #[error("disc playlist or descriptor references a missing file: {0}")]
@@ -151,6 +152,9 @@ enum Shape {
     /// A game folder named after the title; `marker` makes it a RetroBat
     /// directory launch target (PS3/PS4).
     Folder { marker: Option<&'static str> },
+    /// Files laid out relative to the system folder (RetroBat store
+    /// packages keep media in images/, videos/, manuals/).
+    SystemTree,
 }
 
 /// Everything one import will place, before any destination is chosen.
@@ -360,6 +364,54 @@ impl<'a> GameImporter<'a> {
         )
     }
 
+    /// Imports a staged RetroBat store package: `tree` holds the files the
+    /// package places under roms/<system>/, and `launch` is relative to it.
+    pub(crate) fn import_system_tree(
+        &self,
+        entry: &BrowseEntry,
+        package_system: &str,
+        tree: &Path,
+        launch: &Path,
+    ) -> Result<ImportReport, ImportError> {
+        let profiles = load_system_profiles(&self.layout.systems_config())?;
+        let profile = resolve_system(package_system, &profiles)
+            .or_else(|| resolve_system_for_import(entry, &normalized_extension(launch), &profiles))
+            .map(|name| profiles[&name].clone())
+            .ok_or_else(|| ImportError::UnknownSystem(package_system.to_owned()))?;
+        reject_non_directory_or_symlink(tree)?;
+        let tree = tree.canonicalize()?;
+        let mut sources = BTreeMap::new();
+        let mut directories = BTreeSet::new();
+        collect_directory_files(&tree, &tree, &mut sources, &mut directories)?;
+        if !sources.contains_key(launch) {
+            return Err(ImportError::NoDirectoryLaunch(tree.join(launch)));
+        }
+        let files = sources
+            .into_iter()
+            .map(|(relative, path)| (relative, Origin::Owned(path)))
+            .collect();
+        self.commit(
+            entry,
+            &profile,
+            Payload {
+                files,
+                directories: BTreeSet::new(),
+                launch: launch.to_owned(),
+                shape: Shape::SystemTree,
+                core: None,
+            },
+        )
+    }
+
+    pub(crate) fn import_owned_file(
+        &self,
+        entry: &BrowseEntry,
+        staged: &Path,
+        core: Option<String>,
+    ) -> Result<ImportReport, ImportError> {
+        self.import_file_with(entry, staged, true, core)
+    }
+
     pub fn audit_coverage(&self, entries: &[BrowseEntry]) -> Result<ImportCoverage, ImportError> {
         let profiles = load_system_profiles(&self.layout.systems_config())?;
         let uncovered_entry_ids = entries
@@ -371,79 +423,6 @@ impl<'a> GameImporter<'a> {
             total_entries: entries.len(),
             covered_entries: entries.len() - uncovered_entry_ids.len(),
             uncovered_entry_ids,
-        })
-    }
-
-    /// Records a game that RetroBat's store installer placed under roms/.
-    pub fn register_existing(
-        &self,
-        entry: &BrowseEntry,
-        catalogue_system: &str,
-        launch_file: &Path,
-    ) -> Result<ImportReport, ImportError> {
-        let profiles = load_system_profiles(&self.layout.systems_config())?;
-        let profile_name = resolve_system(catalogue_system, &profiles)
-            .ok_or_else(|| ImportError::UnknownSystem(catalogue_system.to_owned()))?;
-        let profile = &profiles[&profile_name];
-        reject_non_file_or_symlink(launch_file)?;
-        let extension = normalized_extension(launch_file);
-        if !profile.extensions.contains(&extension) {
-            return Err(ImportError::UnsupportedExtension {
-                system: profile.rom_folder.clone(),
-                extension,
-            });
-        }
-        let launch_file = launch_file.canonicalize()?;
-        let system_root = self
-            .layout
-            .retrobat_root()
-            .join("roms")
-            .join(&profile.rom_folder)
-            .canonicalize()?;
-        if !launch_file.starts_with(&system_root) {
-            return Err(ImportError::UnsafeReference(launch_file));
-        }
-        let launch_relative_path = launch_file
-            .strip_prefix(&self.layout.root)
-            .map_err(|_| ImportError::UnsafeReference(launch_file.clone()))?
-            .to_owned();
-        validate_relative(&launch_relative_path)?;
-        let digest = hash_file(
-            &launch_file,
-            should_verify_sha1(&profile.rom_folder, &extension),
-        )?;
-        let matched_catalog_sha1 = (!entry.known_sha1.is_empty()).then(|| {
-            digest
-                .sha1
-                .as_ref()
-                .is_some_and(|actual| entry.known_sha1.contains(actual))
-        });
-        let manifest = ImportedManifest {
-            schema_version: 1,
-            catalog_id: entry.id.clone(),
-            title: entry.title.clone(),
-            system: profile.rom_folder.clone(),
-            launch_relative_path: launch_relative_path.clone(),
-            source_sha1: digest.sha1,
-            matched_catalog_sha1,
-            files: vec![ImportedFile {
-                relative_path: launch_relative_path,
-                sha256: digest.sha256,
-                size: digest.size,
-            }],
-            directories: Vec::new(),
-            core: None,
-            imported_at_unix: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        };
-        write_manifest(self.layout, &manifest)?;
-        Ok(ImportReport {
-            system: manifest.system,
-            launch_file,
-            imported_files: 1,
-            imported_bytes: digest.size,
         })
     }
 
@@ -531,6 +510,42 @@ impl<'a> GameImporter<'a> {
                     folder.join(&payload.launch)
                 };
                 (launch, folder)
+            }
+            Shape::SystemTree => {
+                let collides = payload.files.keys().any(|relative| {
+                    fs::symlink_metadata(self.layout.root.join(system_root.join(relative))).is_ok()
+                });
+                if collides {
+                    let folder = self.place_folder(&staged_root, &system_root, &title, None)?;
+                    placed.extend(payload.files.keys().map(|relative| folder.join(relative)));
+                    (folder.join(&payload.launch), folder)
+                } else {
+                    for relative in payload.files.keys() {
+                        let destination_relative = system_root.join(relative);
+                        let result = ensure_safe_parent(&self.layout.root, &destination_relative)
+                            .map_err(ImportError::from)
+                            .and_then(|()| {
+                                let destination = self.layout.root.join(&destination_relative);
+                                if !reserve_file(&destination)? {
+                                    return Err(ImportError::DestinationExhausted(destination));
+                                }
+                                fs::rename(staged_root.join(relative), &destination).map_err(
+                                    |error| {
+                                        let _ = fs::remove_file(&destination);
+                                        ImportError::from(error)
+                                    },
+                                )
+                            });
+                        if let Err(error) = result {
+                            for done in &placed {
+                                let _ = fs::remove_file(self.layout.root.join(done));
+                            }
+                            return Err(error);
+                        }
+                        placed.push(destination_relative);
+                    }
+                    (system_root.join(&payload.launch), system_root.clone())
+                }
             }
         };
         let mut source_sha1 = None;
@@ -1007,7 +1022,7 @@ pub(crate) fn resolve_system(
 pub(crate) fn canonical_system_alias(catalogue_system: &str) -> Option<&str> {
     Some(match catalogue_system {
         "chip-8" => "chip8",
-        "doom" => "gzdoom",
+        "doom" => "prboom",
         "handheld-electronic-game" => "lcdgames",
         "jump-n-bump" => "ports",
         "mattel-intellivision" => "intellivision",
@@ -1034,6 +1049,68 @@ pub(crate) fn canonical_system_alias(catalogue_system: &str) -> Option<&str> {
 
 /// Homebrew Hub entries of unknown platform are identified by the ROM.
 const UNKNOWN_HOMEBREW_SYSTEMS: [&str; 4] = ["gb", "gbc", "gba", "nes"];
+
+impl GameImporter<'_> {
+    /// Cards whose pinned download would end in a file their system does
+    /// not accept, so DOWNLOAD would fail after fetching it.
+    pub fn audit_download_formats(
+        &self,
+        entries: &[BrowseEntry],
+        ledger: &crate::downloads::DownloadLedger,
+    ) -> Result<Vec<String>, ImportError> {
+        use crate::downloads::Recipe;
+        let profiles = load_system_profiles(&self.layout.systems_config())?;
+        let mut unplayable = Vec::new();
+        for entry in entries {
+            let Some(pinned) = ledger.get(&entry.id) else {
+                continue;
+            };
+            let accepted = match pinned.recipe {
+                Recipe::File => accepts(entry, &pinned.filename, &profiles),
+                Recipe::ExtractMember => pinned
+                    .member
+                    .as_deref()
+                    .is_some_and(|member| accepts(entry, member, &profiles)),
+                Recipe::Scummvm => accepts(entry, "game.scummvm", &profiles),
+                // The launch file is named explicitly; the game must only
+                // belong to a system this installation has.
+                Recipe::ExtractTree => !import_route_systems(entry, &profiles).is_empty(),
+                // Resolved exactly as `import_system_tree` resolves it.
+                Recipe::RetrobatStore => pinned.member.as_deref().is_some_and(|member| {
+                    let mut parts = Path::new(member).components().skip(1);
+                    let system = parts.next().map(|part| part.as_os_str().to_string_lossy());
+                    system
+                        .and_then(|system| resolve_system(&system, &profiles))
+                        .and_then(|name| profiles.get(&name))
+                        .is_some_and(|profile| {
+                            profile
+                                .extensions
+                                .contains(&normalized_extension(Path::new(member)))
+                        })
+                }),
+            };
+            if !accepted {
+                unplayable.push(entry.id.clone());
+            }
+        }
+        Ok(unplayable)
+    }
+}
+
+/// Whether the system `entry` imports into accepts a file named `name`,
+/// resolved exactly as a single-file import resolves it.
+fn accepts(entry: &BrowseEntry, name: &str, profiles: &BTreeMap<String, SystemProfile>) -> bool {
+    let extension = match normalized_extension(Path::new(name)) {
+        cgb if cgb == ".cgb" => ".gbc".to_owned(),
+        extension => extension,
+    };
+    resolve_system_for_import(entry, &extension, profiles)
+        .and_then(|system| profiles.get(&system))
+        .is_some_and(|profile| {
+            profile.extensions.contains(&extension)
+                || sibling_profile(profile, &extension, profiles).is_some()
+        })
+}
 
 /// Systems that share their emulators, so a card of one plays the other's
 /// files: Game Boy games run on Game Boy Color cards and the reverse.
@@ -1125,6 +1202,47 @@ pub(crate) fn extract_archive(
     destination: &Path,
 ) -> Result<(), ImportError> {
     extract_one(layout, archive, destination)
+}
+
+/// Like `extract_archive`, then also extracts archives nested one level
+/// inside beside them (publishers often wrap the game archive in a
+/// distribution one). Only for locating a pinned member by its hash: the
+/// expanded copies are never imported.
+pub(crate) fn extract_archive_for_member(
+    layout: &PortableLayout,
+    archive: &Path,
+    destination: &Path,
+) -> Result<(), ImportError> {
+    extract_one(layout, archive, destination)?;
+    let mut nested = Vec::new();
+    let mut ignored = BTreeSet::new();
+    let mut files = BTreeMap::new();
+    collect_directory_files(destination, destination, &mut files, &mut ignored)?;
+    for (relative, path) in files {
+        if matches!(
+            normalized_extension(&relative).as_str(),
+            ".zip" | ".7z" | ".rar"
+        ) {
+            nested.push(path);
+        }
+    }
+    for inner in nested {
+        let target = inner.with_extension(format!(
+            "{}.contents",
+            inner
+                .extension()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default()
+        ));
+        fs::create_dir_all(&target)?;
+        // A nested archive that is itself the game (a MAME set inside a
+        // distribution ZIP) stays as it is; only extractable archives add
+        // their contents beside it.
+        if extract_one(layout, &inner, &target).is_err() {
+            let _ = fs::remove_dir_all(&target);
+        }
+    }
+    Ok(())
 }
 
 fn extract_one(
@@ -1262,6 +1380,20 @@ fn validate_archive_listing(listing: &[u8]) -> Result<(), ImportError> {
     } else {
         Ok(())
     }
+}
+
+/// Finds the extracted file whose size and SHA-256 match the pin.
+pub(crate) fn find_by_digest(root: &Path, size: u64, sha256: &str) -> Result<PathBuf, ImportError> {
+    let mut files = BTreeMap::new();
+    collect_directory_files(root, root, &mut files, &mut BTreeSet::new())?;
+    for path in files.into_values() {
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.len() == size)
+            && hash_file(&path, false)?.sha256 == sha256
+        {
+            return Ok(path);
+        }
+    }
+    Err(ImportError::MissingArchiveMember)
 }
 
 fn reject_non_file_or_symlink(path: &Path) -> Result<(), ImportError> {

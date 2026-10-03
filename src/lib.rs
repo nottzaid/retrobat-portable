@@ -4,6 +4,7 @@ pub mod browse_install;
 pub mod catalog;
 pub mod controller_guard;
 pub mod controls;
+pub mod downloads;
 pub mod featured;
 pub mod firmware;
 pub mod import;
@@ -15,7 +16,6 @@ pub mod session;
 pub mod sources;
 
 use serde::Serialize;
-use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::{
@@ -47,6 +47,8 @@ pub struct SelfCheck {
     pub chip8_core_present: bool,
     pub import_coverage: Option<ImportCoverage>,
     pub download_coverage: DownloadCoverage,
+    /// Pinned downloads whose final file their system does not accept.
+    pub unplayable_downloads: Vec<String>,
     pub readiness: Option<ReadinessReport>,
     pub featured_readiness: Option<FeaturedReadinessAudit>,
     pub controls_coverage: ControlsCoverage,
@@ -67,18 +69,21 @@ pub enum SelfCheckError {
     Featured(#[from] featured::FeaturedError),
     #[error(transparent)]
     Controls(#[from] controls::ControlsError),
+    #[error(transparent)]
+    Downloads(#[from] downloads::LedgerError),
 }
 
 pub fn self_check(layout: &PortableLayout) -> Result<SelfCheck, SelfCheckError> {
     let catalog = Catalog::built_in()?;
     let browse = BrowseCatalog::built_in()?;
     let host = HostPlatform::current();
-    let trusted_ids = catalog
-        .entries
-        .iter()
-        .map(|entry| entry.id.as_str())
-        .collect::<HashSet<_>>();
-    let download_coverage = audit_download_coverage(&browse.entries, &trusted_ids);
+    let ledger = downloads::DownloadLedger::built_in()?;
+    let download_coverage = audit_download_coverage(&browse.entries);
+    let unplayable_downloads = if layout.systems_config().is_file() {
+        GameImporter::new(layout).audit_download_formats(&browse.entries, &ledger)?
+    } else {
+        Vec::new()
+    };
     let import_coverage = if layout.systems_config().is_file() {
         Some(GameImporter::new(layout).audit_coverage(&browse.entries)?)
     } else {
@@ -117,6 +122,7 @@ pub fn self_check(layout: &PortableLayout) -> Result<SelfCheck, SelfCheckError> 
         chip8_core_present: layout.retroarch_core("jaxe").is_file(),
         import_coverage,
         download_coverage,
+        unplayable_downloads,
         readiness,
         featured_readiness,
         controls_coverage,

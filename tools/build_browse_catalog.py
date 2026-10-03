@@ -742,7 +742,7 @@ LIBRETRO_SYSTEM_MAP = {
     "Arduous": "arduboy",
     "Atari - 2600": "atari2600",
     "Bandai - WonderSwan Color": "wswan",
-    "Cave Story": "ports",
+    "Cave Story": "cavestory",
     "Coleco - Colecovision": "colecovision",
     "DOS": "dos",
     "GCE - Vectrex": "vectrex",

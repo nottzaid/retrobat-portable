@@ -126,65 +126,69 @@ impl<'a, D: DownloadClient> Installer<'a, D> {
             return Err(InstallError::DestinationExists(destination));
         }
 
-        let operation_id = format!(
-            "{}-{}",
-            std::process::id(),
-            SystemTime::now()
+        let stage = crate::import::StagingDirectory::new(self.layout, "install")?;
+        let staged = stage.path().join("artifact.download");
+        crate::downloads::fetch_verified(
+            self.downloader,
+            &entry.artifact.url,
+            entry.artifact.size,
+            &entry.artifact.sha256,
+            &staged,
+        )
+        .map_err(|error| match error {
+            crate::downloads::VerifiedDownloadError::Download(error) => {
+                InstallError::Download(error)
+            }
+            crate::downloads::VerifiedDownloadError::Io(error) => InstallError::Io(error),
+            crate::downloads::VerifiedDownloadError::TooLarge { expected } => InstallError::Size {
+                expected,
+                actual: expected + 1,
+            },
+            crate::downloads::VerifiedDownloadError::Size { expected, actual } => {
+                InstallError::Size { expected, actual }
+            }
+            crate::downloads::VerifiedDownloadError::Hash { expected, actual } => {
+                InstallError::Hash { expected, actual }
+            }
+        })?;
+        // create_new claims the name, so a file that appeared since the
+        // check above is never overwritten; the rename then replaces only
+        // RetroPort's own empty placeholder.
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(InstallError::DestinationExists(destination));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if let Err(error) = fs::rename(&staged, &destination) {
+            let _ = fs::remove_file(&destination);
+            return Err(error.into());
+        }
+        let manifest = InstalledManifest {
+            schema_version: 1,
+            catalog_id: entry.id.clone(),
+            relative_path: relative,
+            sha256: entry.artifact.sha256.to_ascii_lowercase(),
+            size: entry.artifact.size,
+            installed_at_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos()
-        );
-        let stage_dir = self.layout.staging_root().join(operation_id);
-        fs::create_dir_all(&stage_dir)?;
-        let staged = stage_dir.join("artifact.download");
-
-        let result = (|| {
-            let mut output = File::create(&staged)?;
-            self.downloader.fetch(&entry.artifact.url, &mut output)?;
-            output.sync_all()?;
-            drop(output);
-
-            let (actual_size, actual_hash) = digest_file(&staged)?;
-            if actual_size != entry.artifact.size {
-                return Err(InstallError::Size {
-                    expected: entry.artifact.size,
-                    actual: actual_size,
-                });
-            }
-            if actual_hash != entry.artifact.sha256.to_ascii_lowercase() {
-                return Err(InstallError::Hash {
-                    expected: entry.artifact.sha256.clone(),
-                    actual: actual_hash,
-                });
-            }
-
-            fs::rename(&staged, &destination)?;
-
-            let manifest = InstalledManifest {
-                schema_version: 1,
-                catalog_id: entry.id.clone(),
-                relative_path: relative,
-                sha256: actual_hash.clone(),
-                size: actual_size,
-                installed_at_unix: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            };
-            if let Err(error) = write_manifest(self.layout, &manifest) {
-                let _ = fs::remove_file(&destination);
-                return Err(error);
-            }
-
-            Ok(InstallReport {
-                destination,
-                bytes: actual_size,
-                sha256: actual_hash,
-            })
-        })();
-
-        let _ = fs::remove_dir_all(&stage_dir);
-        result
+                .as_secs(),
+        };
+        if let Err(error) = write_manifest(self.layout, &manifest) {
+            let _ = fs::remove_file(&destination);
+            return Err(error);
+        }
+        Ok(InstallReport {
+            destination,
+            bytes: manifest.size,
+            sha256: manifest.sha256,
+        })
     }
 
     pub fn uninstall(&self, entry: &CatalogEntry) -> Result<UninstallReport, InstallError> {

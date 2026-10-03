@@ -229,10 +229,32 @@ impl ReadinessReport {
     }
 
     pub fn select_backend(&self, retrobat_system: &str, rom: &Path) -> Option<&BackendRoute> {
-        self.backend_routes
+        self.select_backend_preferring(retrobat_system, rom, None)
+    }
+
+    /// Like `select_backend`, but an installed route using `core` wins when
+    /// the content needs it (Game & Watch .mgw packs need the gw core, not
+    /// the system's default MAME).
+    pub fn select_backend_preferring(
+        &self,
+        retrobat_system: &str,
+        rom: &Path,
+        core: Option<&str>,
+    ) -> Option<&BackendRoute> {
+        let routes = self
+            .backend_routes
             .iter()
             .find(|(system, _)| system.eq_ignore_ascii_case(retrobat_system))
-            .and_then(|(_, routes)| routes.iter().find(|route| route.supports(rom)))
+            .map(|(_, routes)| routes)?;
+        core.and_then(|core| {
+            routes.iter().find(|route| {
+                route
+                    .core
+                    .as_deref()
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(core))
+            })
+        })
+        .or_else(|| routes.iter().find(|route| route.supports(rom)))
     }
 }
 
