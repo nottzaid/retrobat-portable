@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use quick_xml::Reader;
@@ -16,6 +16,7 @@ use thiserror::Error;
 
 use crate::browse::BrowseEntry;
 use crate::install::{InstallError, ensure_safe_parent};
+use crate::launch::background_command;
 use crate::paths::PortableLayout;
 
 #[derive(Debug, Error)]
@@ -1161,7 +1162,10 @@ fn run_7zip(
     arguments: impl IntoIterator<Item = std::ffi::OsString> + Clone,
 ) -> Result<Output, ImportError> {
     for program in seven_zip_candidates(layout) {
-        match Command::new(&program).args(arguments.clone()).output() {
+        match background_command(&program)
+            .args(arguments.clone())
+            .output()
+        {
             Ok(output) => return Ok(output),
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {

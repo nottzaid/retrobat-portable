@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::browse::{BrowseCatalog, BrowseEntry};
-use crate::import::ImportedManifest;
+use crate::import::{ImportedManifest, canonical_system_alias};
+use crate::launch::{HostPlatform, retroarch_input_overrides, uses_direct_retroarch};
 use crate::paths::PortableLayout;
+use crate::readiness::ReadinessReport;
 
 const CONTROLS: &[u8] = include_bytes!("../catalog/controls-v1.json.gz");
 
@@ -173,13 +175,37 @@ impl ControlsCatalog {
         layout: &PortableLayout,
         entry: &BrowseEntry,
         imported: Option<&ImportedManifest>,
+        readiness: Option<&ReadinessReport>,
     ) -> GameControls {
-        let config = effective_retroarch_config(layout, &entry.system);
+        // The RetroBat system and route PLAY would use for this card.
+        let system_readiness =
+            readiness.and_then(|report| report.for_catalog_system(&entry.system));
+        let retrobat_system = imported
+            .map(|manifest| manifest.system.clone())
+            .or_else(|| {
+                system_readiness.and_then(|system| system.retrobat_systems.first().cloned())
+            })
+            .unwrap_or_else(|| {
+                canonical_system_alias(&entry.system)
+                    .unwrap_or(&entry.system)
+                    .to_owned()
+            });
+        let route = system_readiness.and_then(|system| system.ready_route.as_ref());
+        let direct = uses_direct_retroarch(
+            HostPlatform::current(),
+            &retrobat_system,
+            route.map(|route| route.emulator.as_str()),
+        );
+        let config = effective_retroarch_config(layout, &retrobat_system, direct);
         let mut keyboard = keyboard_bindings(&config);
         let controller_device = controller_profile(layout);
         let mut controller = controller_bindings(controller_device.as_ref());
         let mut sources = vec![ControlSource {
-            name: "Installed RetroArch/RetroBat input configuration".to_owned(),
+            name: if direct {
+                "Installed RetroArch configuration with RetroPort's launch overrides".to_owned()
+            } else {
+                "Installed RetroArch/RetroBat input configuration".to_owned()
+            },
             version: layout
                 .retroarch_root()
                 .join("retroarch.cfg")
@@ -189,8 +215,11 @@ impl ControlsCatalog {
         }];
         let mut notes = Vec::new();
         let mut device_summary = vec![format!(
-            "Backend system: {} · virtual input surface: RetroPad",
-            entry.system.to_ascii_uppercase()
+            "Backend system: {}{} · virtual input surface: RetroPad",
+            retrobat_system.to_ascii_uppercase(),
+            route
+                .map(|route| format!(" through {}", route.label()))
+                .unwrap_or_default()
         )];
         let mut scope = "Installed system/backend profile".to_owned();
         let mut confidence =
@@ -334,7 +363,14 @@ impl ControlsCatalog {
                     .to_owned(),
             );
         }
-        notes.push("Esc closes direct RetroArch games.".to_owned());
+        if direct {
+            notes.push("Esc closes the game; F1 opens RetroArch's Quick Menu.".to_owned());
+        } else {
+            notes.push(
+                "This system starts through its own emulator; TERMINATE on the card always stops it."
+                    .to_owned(),
+            );
+        }
         GameControls {
             title: entry.title.clone(),
             scope,
@@ -376,14 +412,21 @@ fn parse_config(path: &Path) -> HashMap<String, String> {
         .collect()
 }
 
-fn effective_retroarch_config(layout: &PortableLayout, system: &str) -> HashMap<String, String> {
+/// The keyboard and pad binds a launch of `system` runs with: the shared
+/// RetroArch configuration, plus the overrides PLAY appends on direct routes.
+fn effective_retroarch_config(
+    layout: &PortableLayout,
+    system: &str,
+    direct: bool,
+) -> HashMap<String, String> {
     let mut values = parse_config(&layout.retroarch_root().join("retroarch.cfg"));
-    values.extend(parse_config(
-        &layout
-            .metadata_root()
-            .join("runtime/retroarch")
-            .join(format!("{system}.cfg")),
-    ));
+    if direct {
+        values.extend(
+            retroarch_input_overrides(system)
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned())),
+        );
+    }
     values
 }
 
@@ -544,7 +587,7 @@ mod tests {
             .unwrap();
         let controls = ControlsCatalog::built_in().unwrap();
         let layout = PortableLayout::new("/tmp/unused");
-        let profile = controls.for_game(&layout, entry, None);
+        let profile = controls.for_game(&layout, entry, None, None);
         assert!(profile.scope.contains("MAME"));
         assert!(
             profile

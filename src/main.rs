@@ -3029,7 +3029,12 @@ impl eframe::App for PortableApp {
                         && let Some(controls) = &self.controls
                     {
                         let imported = self.imported_manifests.get(&entry.id);
-                        self.controls_dialog = Some(controls.for_game(&layout, &entry, imported));
+                        self.controls_dialog = Some(controls.for_game(
+&layout,
+&entry,
+imported,
+self.readiness.as_ref(),
+));
                     }
                     if let Some((catalog_id, title)) = requested_remove_import {
                         self.start_remove_import(catalog_id, title);
