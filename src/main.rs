@@ -266,6 +266,17 @@ fn main() -> eframe::Result {
                 eprintln!("Unknown browse catalog id: {requested_id}");
                 std::process::exit(2);
             });
+        if ReadinessReport::audit(&layout, std::slice::from_ref(entry))
+            .ok()
+            .and_then(|report| report.for_catalog_system(&entry.system).cloned())
+            .is_some_and(|system| system.backend == BackendState::EmulatorMissing)
+        {
+            eprintln!(
+                "This installation has no emulator for {}, so the game could not be played; nothing was downloaded.",
+                entry.system
+            );
+            std::process::exit(1);
+        }
         let downloader = ReqwestDownloader::new().unwrap_or_else(|error| {
             eprintln!("Could not initialize downloader: {error}");
             std::process::exit(1);
@@ -730,9 +741,9 @@ fn load_library(layout: &PortableLayout) -> LoadedLibrary {
     let readiness = match ReadinessReport::audit(layout, &browse.entries) {
         Ok(report) => {
             status = format!(
-                "{status} Backend audit: {} title(s) ready now, {} provisioned on first play, {} unresolved.",
+                "{status} Backend audit: {} title(s) ready now, {} without an installed emulator, {} unresolved.",
                 report.ready_now_entries,
-                report.provision_on_first_play_entries,
+                report.emulator_missing_entries,
                 report.unresolved_entries
             );
             Some(report)
@@ -1103,10 +1114,10 @@ impl PortableApp {
                                     |route| format!("Installed route: {}", route.label()),
                                 ),
                             ),
-                            BackendState::ProvisionOnFirstPlay => (
-                                "EMULATOR SETUP ON FIRST PLAY",
-                                WARN,
-                                "RetroBat has a system adapter but no configured backend is installed yet. It may download one on first play.".to_owned(),
+                            BackendState::EmulatorMissing => (
+                                "EMULATOR NOT INSTALLED",
+                                BAD,
+                                "RetroBat lists an emulator for this system, but this installation does not include it, so PLAY cannot start these games.".to_owned(),
                             ),
                             BackendState::Unresolved => (
                                 "BACKEND NOT YET RESOLVED",
@@ -1208,7 +1219,15 @@ impl PortableApp {
                 })
             });
         let busy = self.operation.is_some();
+        // A game whose system has no installed emulator could be fetched but
+        // never started.
+        let emulator_missing = self
+            .readiness
+            .as_ref()
+            .and_then(|report| report.for_catalog_system(&entry.system))
+            .is_some_and(|system| system.backend == BackendState::EmulatorMissing);
         let (label, intent) = match &playable {
+            Some(_) if emulator_missing => ("NO EMULATOR".to_owned(), GameButtonIntent::Disabled),
             Some(_) => game_button_state(
                 self.running_game
                     .as_ref()
@@ -1216,6 +1235,9 @@ impl PortableApp {
                 &entry.id,
             ),
             None => match download {
+                Some(Ok(_)) if emulator_missing => {
+                    ("NO EMULATOR".to_owned(), GameButtonIntent::Disabled)
+                }
                 Some(Ok(_)) => ("DOWNLOAD".to_owned(), GameButtonIntent::Play),
                 Some(Err(_)) => ("UNAVAILABLE".to_owned(), GameButtonIntent::Disabled),
                 None => ("IMPORT GAME".to_owned(), GameButtonIntent::Play),
@@ -1967,10 +1989,10 @@ impl PortableApp {
                             .color(egui::Color32::from_rgb(98, 211, 145)),
                     );
                 }
-                BackendState::ProvisionOnFirstPlay => {
+                BackendState::EmulatorMissing => {
                     root.label(
                         egui::RichText::new(
-                            "EMULATOR SETUP ON FIRST PLAY · RetroBat may need an internet connection once.",
+                            "EMULATOR NOT INSTALLED · This installation has no emulator for this system yet.",
                         )
                         .small()
                         .strong()
@@ -2851,9 +2873,9 @@ impl eframe::App for PortableApp {
                     if let Some(readiness) = &self.readiness {
                         ui.collapsing("SYSTEM READINESS", |ui| {
                             ui.label(format!(
-                                "{} titles have an installed backend · {} can provision a backend on first play · {} remain unresolved",
+                                "{} titles have an installed backend · {} have no installed emulator · {} remain unresolved",
                                 readiness.ready_now_entries,
-                                readiness.provision_on_first_play_entries,
+                                readiness.emulator_missing_entries,
                                 readiness.unresolved_entries
                             ));
                             ui.label(
@@ -2879,9 +2901,7 @@ impl eframe::App for PortableApp {
                             for system in attention {
                                 let backend = match system.backend {
                                     BackendState::ReadyNow => "backend ready",
-                                    BackendState::ProvisionOnFirstPlay => {
-                                        "emulator setup on first play"
-                                    }
+                                    BackendState::EmulatorMissing => "emulator not installed",
                                     BackendState::Unresolved => "backend unresolved",
                                 };
                                 let firmware = match system.firmware {

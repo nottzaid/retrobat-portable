@@ -45,7 +45,7 @@ pub struct FeaturedReadinessAudit {
     pub evidence_title_records: usize,
     pub unique_catalog_entries: usize,
     pub ready_now_titles: usize,
-    pub provision_on_first_play_titles: usize,
+    pub emulator_missing_titles: usize,
     pub firmware_blocked_titles: usize,
     pub unresolved_titles: usize,
     pub sourced_artwork_titles: usize,
@@ -145,7 +145,7 @@ impl FeaturedCatalog {
             evidence_title_records: self.titles.len(),
             unique_catalog_entries: self.entry_ids.len(),
             ready_now_titles: 0,
-            provision_on_first_play_titles: 0,
+            emulator_missing_titles: 0,
             firmware_blocked_titles: 0,
             unresolved_titles: 0,
             sourced_artwork_titles: 0,
@@ -164,7 +164,7 @@ impl FeaturedCatalog {
                 audit.sourced_artwork_titles += 1;
             }
             let mut ready = false;
-            let mut provision = false;
+            let mut emulator_missing = false;
             let mut firmware_blocked = false;
             let mut systems = entries
                 .iter()
@@ -183,16 +183,16 @@ impl FeaturedCatalog {
                 match system.backend {
                     BackendState::ReadyNow if firmware_ready => ready = true,
                     BackendState::ReadyNow => firmware_blocked = true,
-                    BackendState::ProvisionOnFirstPlay => provision = true,
+                    BackendState::EmulatorMissing => emulator_missing = true,
                     BackendState::Unresolved => {}
                 }
             }
             let state = if ready {
                 audit.ready_now_titles += 1;
                 "ready_now"
-            } else if provision {
-                audit.provision_on_first_play_titles += 1;
-                "provision_on_first_play"
+            } else if emulator_missing {
+                audit.emulator_missing_titles += 1;
+                "emulator_missing"
             } else if firmware_blocked {
                 audit.firmware_blocked_titles += 1;
                 "firmware_blocked"

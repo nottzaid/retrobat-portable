@@ -26,7 +26,8 @@ pub enum ReadinessError {
 #[serde(rename_all = "snake_case")]
 pub enum BackendState {
     ReadyNow,
-    ProvisionOnFirstPlay,
+    /// RetroBat lists an emulator for the system, but none is installed.
+    EmulatorMissing,
     Unresolved,
 }
 
@@ -116,7 +117,7 @@ pub enum FirmwareInstallAction {
 pub struct ReadinessReport {
     pub total_entries: usize,
     pub ready_now_entries: usize,
-    pub provision_on_first_play_entries: usize,
+    pub emulator_missing_entries: usize,
     pub unresolved_entries: usize,
     pub firmware_required_entries: usize,
     pub firmware_required_missing_entries: usize,
@@ -132,7 +133,7 @@ impl ReadinessReport {
         let mut backend_routes = BTreeMap::new();
         for (system, configuration) in &configured {
             let mut routes = configuration.available_routes(layout, &inventory);
-            prefer_firmware_free_route(system, &mut routes);
+            prefer_best_route(layout, system, &mut routes);
             backend_routes.insert(system.clone(), routes);
         }
         if layout.retroarch_executable().is_file() && layout.retroarch_core("jaxe").is_file() {
@@ -167,7 +168,7 @@ impl ReadinessReport {
             let backend = if all_candidates_ready {
                 BackendState::ReadyNow
             } else if any_configured {
-                BackendState::ProvisionOnFirstPlay
+                BackendState::EmulatorMissing
             } else {
                 BackendState::Unresolved
             };
@@ -196,8 +197,7 @@ impl ReadinessReport {
         }
 
         let ready_now_entries = entries_for_state(&systems, BackendState::ReadyNow);
-        let provision_on_first_play_entries =
-            entries_for_state(&systems, BackendState::ProvisionOnFirstPlay);
+        let emulator_missing_entries = entries_for_state(&systems, BackendState::EmulatorMissing);
         let unresolved_entries = entries_for_state(&systems, BackendState::Unresolved);
         let firmware_required_entries = systems
             .iter()
@@ -213,7 +213,7 @@ impl ReadinessReport {
         Ok(Self {
             total_entries: entries.len(),
             ready_now_entries,
-            provision_on_first_play_entries,
+            emulator_missing_entries,
             unresolved_entries,
             firmware_required_entries,
             firmware_required_missing_entries,
@@ -258,14 +258,40 @@ impl ReadinessReport {
     }
 }
 
-fn prefer_firmware_free_route(system: &str, routes: &mut [BackendRoute]) {
-    // Keep RetroBat's configured order except where an established HLE backend
-    // is specifically installed to provide a no-console-ROM fallback. Users
-    // can still select the higher-compatibility alternatives after importing
-    // their own firmware.
+/// Puts the best installed route first: the accuracy reference for the
+/// system, using the owner's official BIOS whenever it is present. Without
+/// that BIOS a built-in-BIOS route comes first, so PLAY works until it is
+/// imported. There is no per-game backend picker, so this ordering is what
+/// makes importing a BIOS take effect.
+fn prefer_best_route(layout: &PortableLayout, system: &str, routes: &mut [BackendRoute]) {
+    let bios = layout.retrobat_root().join("bios");
+    let has = |name: &str| bios.join(name).is_file();
     let preferred = match system {
-        "ps2" => Some("play"),
+        // The accuracy references, installed and full speed on ordinary
+        // hardware; neither needs a BIOS.
+        "nes" => Some("mesen"),
+        "snes" => Some("bsnes"),
+        "gb" | "gbc" => Some("sameboy"),
+        // PCSX ReARMed has a built-in HLE BIOS; Beetle PSX stops at a
+        // "Firmware is missing" screen without one.
+        "psx"
+            if !["scph5500.bin", "scph5501.bin", "scph5502.bin"]
+                .iter()
+                .any(|name| has(name)) =>
+        {
+            Some("pcsx_rearmed")
+        }
+        // Play! needs no BIOS; PCSX2, the reference, needs one in
+        // bios/pcsx2/bios and comes first (RetroBat's order) once it is there.
+        "ps2" if !directory_contains_regular_file(&bios.join("pcsx2").join("bios")) => Some("play"),
+        // Beetle Saturn (Mednafen), the accuracy reference, reads the
+        // regional BIOS files; YabaSanshiro reads a single saturn_bios.bin.
+        // Every installed Saturn core refuses to start without a BIOS.
+        "saturn" if has("mpr-17933.bin") || has("sega_101.bin") => Some("mednafen_saturn"),
         "saturn" => Some("yabasanshiro"),
+        // xemu, the reference, needs the console's boot ROM and flash BIOS;
+        // Cxbx-Reloaded needs neither.
+        "xbox" if !(has("mcpx_1.0.bin") && has("Complex_4627.bin")) => Some("cxbx"),
         _ => None,
     };
     if let Some(preferred) = preferred
@@ -783,6 +809,28 @@ fn curated_standalone_firmware(
                 optional: false,
             },
         ],
+        // Play! and Cxbx-Reloaded run without a BIOS; the owner's official
+        // BIOS switches PLAY to the reference emulators, PCSX2 and xemu.
+        ("ps2", Some("play")) => vec![CoreFirmwareFile {
+            path: "pcsx2/bios".to_owned(),
+            description: "PlayStation 2 BIOS from your console — switches PLAY to PCSX2".to_owned(),
+            directory: true,
+            optional: true,
+        }],
+        ("xbox", Some("cxbx")) => vec![
+            CoreFirmwareFile {
+                path: "mcpx_1.0.bin".to_owned(),
+                description: "Xbox MCPX 1.0 boot ROM from your console — with the flash BIOS, switches PLAY to xemu".to_owned(),
+                directory: false,
+                optional: true,
+            },
+            CoreFirmwareFile {
+                path: "Complex_4627.bin".to_owned(),
+                description: "Xbox flash BIOS from your console (retail 4627 works), placed under the name RetroBat's xemu setup reads".to_owned(),
+                directory: false,
+                optional: true,
+            },
+        ],
         ("switch", Some("eden")) => vec![CoreFirmwareFile {
             path: "eden/keys/prod.keys".to_owned(),
             description: "Nintendo Switch prod.keys dumped from the user's console".to_owned(),
@@ -796,15 +844,9 @@ fn curated_standalone_firmware(
 fn core_has_documented_firmware_fallback(core: &str) -> bool {
     matches!(
         core.to_ascii_lowercase().as_str(),
-        // Beetle PSX HW uses OpenBIOS when no user BIOS is supplied:
-        // https://docs.libretro.com/library/beetle_psx_hw/#bios
-        "mednafen_psx_hw"
-            // PUAE's automatic Kickstart selection can use its built-in AROS
-            // replacement: https://docs.libretro.com/library/puae/
-            | "puae"
-            // Libretro's YabaSanshiro documentation explicitly labels
-            // saturn_bios.bin optional; the core has a built-in HLE path.
-            | "yabasanshiro"
+        // PUAE's automatic Kickstart selection can use its built-in AROS
+        // replacement: https://docs.libretro.com/library/puae/
+        "puae"
     )
 }
 
@@ -888,25 +930,29 @@ fn directory_contains_regular_file(path: &Path) -> bool {
 
 fn firmware_guidance(system: &str, core: &str, optional: bool) -> (&'static str, &'static str) {
     match system {
+        "psx" if optional => (
+            "https://docs.libretro.com/library/pcsx_rearmed/",
+            "PCSX ReARMed plays without this file through its built-in HLE BIOS. Adding a BIOS dumped from your own console switches PLAY to the more accurate Beetle PSX HW core.",
+        ),
         "psx" => (
             "https://docs.libretro.com/library/beetle_psx_hw/",
-            "Beetle PSX HW uses OpenBIOS automatically, so this external BIOS is optional for play. Its core page documents every supported filename and regional compatibility detail.",
+            "Beetle PSX HW needs a PlayStation BIOS dumped from your own console. Its core page documents every supported filename and regional detail.",
         ),
         "ps2" => (
-            "https://docs.libretro.com/library/lrps2/#bios",
-            "LRPS2 accepts any properly dumped PS2 BIOS filename inside bios/pcsx2/bios; no exact filename or hash is required by this importer.",
+            "https://pcsx2.net/docs/setup/bios/",
+            "Play! runs PS2 games without a BIOS. Add the BIOS dumped from your own PS2 (any region or revision, under any name; RetroPort recognises it) and PLAY switches to PCSX2, the reference PS2 emulator. PCSX2's guide shows how to dump it.",
         ),
         "ps3" => (
             "https://www.playstation.com/en-ph/support/hardware/ps3/system-software/",
             "Download Sony's official PS3 update as PS3UPDAT.PUP. RetroBat detects it in the BIOS root and RPCS3 installs it automatically on the next launch.",
         ),
         "saturn" => (
-            "https://docs.libretro.com/library/kronos/",
-            "Kronos documents the Saturn/ST-V firmware expected by this installed core. Dump the requested firmware from hardware you own.",
+            "https://docs.libretro.com/library/yabasanshiro/",
+            "Saturn games need a BIOS dumped from your own console: every installed Saturn core stops without one. With mpr-17933.bin (USA/Europe) or sega_101.bin (Japan), PLAY uses Beetle Saturn, the accuracy reference; saturn_bios.bin alone starts YabaSanshiro.",
         ),
         "xbox" => (
             "https://xemu.app/docs/required-files/",
-            "xemu documents each required Xbox system file and the owner-dump requirement.",
+            "Cxbx-Reloaded runs Xbox games without a BIOS. Add your console's MCPX boot ROM and flash BIOS and PLAY switches to xemu, the reference Xbox emulator; xemu's guide shows how to dump both.",
         ),
         "switch" => (
             "https://git.eden-emu.dev/eden-emu/eden",
