@@ -624,6 +624,22 @@ impl LaunchPlan {
         )
     }
 
+    /// Opens RetroArch's local command port for this launch only, so a
+    /// diagnostic run can ask the running game for a screenshot. Returns
+    /// false when the plan does not start RetroArch directly.
+    pub fn enable_retroarch_commands(&mut self, port: u16) -> bool {
+        if self.log_file.is_none() {
+            return false;
+        }
+        let Some((_, config)) = self.generated_files.first_mut() else {
+            return false;
+        };
+        config.push_str(&format!(
+            "network_cmd_enable = \"true\"\nnetwork_cmd_port = \"{port}\"\n"
+        ));
+        true
+    }
+
     /// Prepares everything the backend needs and starts it in its own
     /// process group. Preparing a new Wine prefix can take a minute, so call
     /// this from a worker thread; `progress` receives user-facing phases.

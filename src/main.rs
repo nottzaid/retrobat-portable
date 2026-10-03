@@ -5,7 +5,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -533,7 +534,41 @@ fn main() -> eframe::Result {
                 gameplay_probe,
             )))
         }),
-    )
+    )?;
+    if GAMEPLAY_PROBE_FAILED.load(Ordering::SeqCst) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// What a backend's own log says about a launch.
+#[derive(serde::Serialize)]
+struct BackendLogEvidence {
+    path: String,
+    core_loaded: bool,
+    content_loaded: bool,
+    errors: Vec<String>,
+}
+
+fn backend_log_evidence(path: &std::path::Path) -> BackendLogEvidence {
+    let text = std::fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let errors = text
+        .lines()
+        .filter(|line| line.contains("[ERROR]"))
+        .take(8)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    BackendLogEvidence {
+        path: path.display().to_string(),
+        core_loaded: text.contains("Loading dynamic libretro core from"),
+        // RetroArch reports core geometry only after retro_load_game accepted
+        // the content, including cores that load their content themselves.
+        content_loaded: text.contains("[Core] Geometry:")
+            && !text.contains("Failed to load content"),
+        errors,
+    }
 }
 
 struct ArtworkMessage {
@@ -801,12 +836,102 @@ struct GameplayProbeConfig {
     duration: Duration,
 }
 
+/// Set when a gameplay probe observes anything other than a launch that runs
+/// until its deadline and then leaves no process behind; the process exits
+/// non-zero so scripted runs cannot mistake a crash for sustained execution.
+static GAMEPLAY_PROBE_FAILED: AtomicBool = AtomicBool::new(false);
+
+const PROBE_RETROARCH_COMMAND_PORT: u16 = 55355;
+
 struct GameplayProbe {
     config: GameplayProbeConfig,
+    created: Instant,
     started: bool,
     deadline_receiver: Option<Receiver<()>>,
+    screenshot_receiver: Option<Receiver<serde_json::Value>>,
     terminating: bool,
     complete_recorded: bool,
+}
+
+/// Asks the running RetroArch for screenshots and describes what the game
+/// was displaying. A game may be between screens (a fade to black or white)
+/// at any one moment, so up to five frames about 1.5 s apart are sampled;
+/// the frame counts as blank only if every sample is.
+fn capture_retroarch_screenshot(screenshots: PathBuf) -> serde_json::Value {
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 1;
+    loop {
+        let mut frame = capture_one_retroarch_screenshot(&screenshots);
+        let blank = frame.get("blank") == Some(&serde_json::Value::Bool(true));
+        if !blank || attempt == ATTEMPTS {
+            frame["samples"] = attempt.into();
+            return frame;
+        }
+        attempt += 1;
+        thread::sleep(Duration::from_millis(1500));
+    }
+}
+
+fn capture_one_retroarch_screenshot(screenshots: &Path) -> serde_json::Value {
+    let started = std::time::SystemTime::now();
+    let sent = std::net::UdpSocket::bind("127.0.0.1:0").and_then(|socket| {
+        socket.send_to(b"SCREENSHOT", ("127.0.0.1", PROBE_RETROARCH_COMMAND_PORT))
+    });
+    if let Err(error) = sent {
+        return serde_json::json!({ "error": format!("command port: {error}") });
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        let newest = std::fs::read_dir(screenshots).ok().and_then(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+                })
+                .filter_map(|entry| {
+                    let modified = entry.metadata().ok()?.modified().ok()?;
+                    (modified >= started).then(|| (modified, entry.path()))
+                })
+                .max()
+        });
+        if let Some((_, path)) = newest {
+            // RetroArch writes the PNG incrementally and, under load, in
+            // bursts; retry decoding until it is complete.
+            let mut last_error = String::new();
+            while Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(250));
+                match image::open(&path) {
+                    Ok(frame) => {
+                        let rgba = frame.to_rgba8();
+                        let mut colors = HashSet::new();
+                        for pixel in rgba.pixels().step_by(7) {
+                            colors.insert(pixel.0);
+                            if colors.len() > 4096 {
+                                break;
+                            }
+                        }
+                        return serde_json::json!({
+                            "path": path.display().to_string(),
+                            "width": rgba.width(),
+                            "height": rgba.height(),
+                            "sampled_colors": colors.len(),
+                            "blank": colors.len() < 2,
+                        });
+                    }
+                    Err(error) => last_error = error.to_string(),
+                }
+            }
+            return serde_json::json!({
+                "path": path.display().to_string(),
+                "error": last_error,
+            });
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    serde_json::json!({ "error": "RetroArch wrote no screenshot within 15 seconds" })
 }
 
 impl GameplayProbe {
@@ -814,19 +939,35 @@ impl GameplayProbe {
         let _ = std::fs::remove_file(&config.output);
         Self {
             config,
+            created: Instant::now(),
             started: false,
             deadline_receiver: None,
+            screenshot_receiver: None,
             terminating: false,
             complete_recorded: false,
         }
     }
 
-    fn record(&self, event: &str) -> std::io::Result<()> {
+    fn record(&self, event: &str, detail: serde_json::Value) -> std::io::Result<()> {
+        let mut record = serde_json::json!({
+            "event": event,
+            "elapsed_ms": self.created.elapsed().as_millis() as u64,
+        });
+        if let (Some(record), serde_json::Value::Object(detail)) = (record.as_object_mut(), detail)
+        {
+            record.extend(detail);
+        }
         let mut output = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.config.output)?;
-        writeln!(output, "{{\"event\":\"{event}\"}}")
+        writeln!(output, "{record}")?;
+        output.sync_data()
+    }
+
+    fn fail(&self, event: &str, detail: serde_json::Value) {
+        GAMEPLAY_PROBE_FAILED.store(true, Ordering::SeqCst);
+        let _ = self.record(event, detail);
     }
 }
 
@@ -2634,7 +2775,7 @@ impl PortableApp {
             })
             .cloned();
         let route_label = backend.as_ref().map(|route| route.label());
-        let plan =
+        let mut plan =
             match LaunchPlan::for_current_game_with_backend(&layout, system, rom, backend.as_ref())
             {
                 Ok(plan) => plan,
@@ -2643,6 +2784,9 @@ impl PortableApp {
                     return;
                 }
             };
+        if self.gameplay_probe.is_some() {
+            plan.enable_retroarch_commands(PROBE_RETROARCH_COMMAND_PORT);
+        }
         let context = self.context.clone();
         self.running_game = Some(GameSession::start(plan, catalog_id, title, move || {
             context.request_repaint()
@@ -2731,14 +2875,26 @@ impl eframe::App for PortableApp {
                     .root
                     .join(&manifest.launch_relative_path);
                 self.launch_game(&entry.id, &entry.title, &manifest.system, &rom);
-                if self.running_game.is_none()
-                    && let Some(probe) = &self.gameplay_probe
-                {
-                    let _ = probe.record("launch_failed");
+                if self.running_game.is_some() {
+                    if let Some(probe) = &self.gameplay_probe {
+                        let _ = probe.record(
+                            "launch_requested",
+                            serde_json::json!({
+                                "system": manifest.system,
+                                "launch_file": rom.display().to_string(),
+                                "status": self.status,
+                            }),
+                        );
+                    }
+                } else if let Some(probe) = &self.gameplay_probe {
+                    probe.fail(
+                        "launch_failed",
+                        serde_json::json!({ "status": self.status }),
+                    );
                     context.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             } else if let Some(probe) = &self.gameplay_probe {
-                let _ = probe.record("imported_game_not_found");
+                probe.fail("imported_game_not_found", serde_json::json!({}));
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
@@ -2781,8 +2937,13 @@ impl eframe::App for PortableApp {
             .unwrap_or_default();
         for event in session_events {
             match event {
-                SessionEvent::Phase(phase) => self.status = phase,
-                SessionEvent::Started { .. } => {
+                SessionEvent::Phase(phase) => {
+                    if let Some(probe) = &self.gameplay_probe {
+                        let _ = probe.record("phase", serde_json::json!({ "phase": phase }));
+                    }
+                    self.status = phase;
+                }
+                SessionEvent::Started { process_id } => {
                     if let Some(probe) = &mut self.gameplay_probe {
                         // The measured window starts with the backend itself,
                         // not with first-time preparation such as Wine setup.
@@ -2795,16 +2956,38 @@ impl eframe::App for PortableApp {
                             repaint.request_repaint();
                         });
                         probe.deadline_receiver = Some(receiver);
-                        let _ = probe.record("game_launched");
+                        let _ = probe.record(
+                            "game_started",
+                            serde_json::json!({ "process_id": process_id }),
+                        );
                     }
                 }
-                SessionEvent::Exited { message, .. } => {
-                    self.running_game = None;
-                    if let Some(probe) = &mut self.gameplay_probe
+                SessionEvent::Exited { message, failed } => {
+                    let finished = self.running_game.take();
+                    if let (Some(probe), Some(game)) = (&mut self.gameplay_probe, finished)
                         && probe.started
-                        && !probe.terminating
+                        && !probe.complete_recorded
                     {
-                        let _ = probe.record("exited_before_deadline");
+                        let evidence = game.log_file.as_deref().map(backend_log_evidence);
+                        let tree_running = game.tree_is_running();
+                        let detail = serde_json::json!({
+                            "status": message,
+                            "failed": failed,
+                            "process_tree_running": tree_running,
+                            "backend_log": evidence,
+                        });
+                        if !probe.terminating {
+                            probe.fail("exited_before_deadline", detail);
+                        } else if tree_running {
+                            probe.fail("process_tree_survived_termination", detail);
+                        } else if evidence
+                            .as_ref()
+                            .is_some_and(|evidence| !evidence.content_loaded)
+                        {
+                            probe.fail("backend_did_not_load_content", detail);
+                        } else {
+                            let _ = probe.record("terminated", detail);
+                        }
                         probe.terminating = true;
                     }
                     self.status = message;
@@ -2817,12 +3000,62 @@ impl eframe::App for PortableApp {
             .and_then(|probe| probe.deadline_receiver.as_ref())
             .is_some_and(|receiver| receiver.try_recv().is_ok());
         if gameplay_probe_deadline {
+            let alive = self.running_game.as_ref().map(GameSession::tree_is_running);
+            let retroarch = self
+                .running_game
+                .as_ref()
+                .is_some_and(|game| game.log_file.is_some());
+            let screenshots = self.layout.clone().retrobat_root().join("screenshots");
+            let mut terminate_now = true;
             if let Some(probe) = &mut self.gameplay_probe {
                 probe.deadline_receiver = None;
+                match alive {
+                    Some(true) => {
+                        let _ = probe.record("alive_at_deadline", serde_json::json!({}));
+                        if retroarch {
+                            let (sender, receiver) = mpsc::channel();
+                            let repaint = self.context.clone();
+                            thread::spawn(move || {
+                                let _ = sender.send(capture_retroarch_screenshot(screenshots));
+                                repaint.request_repaint();
+                            });
+                            probe.screenshot_receiver = Some(receiver);
+                            terminate_now = false;
+                        }
+                    }
+                    _ => probe.fail(
+                        "not_running_at_deadline",
+                        serde_json::json!({ "status": self.status }),
+                    ),
+                }
+                probe.terminating = terminate_now;
+            }
+            if terminate_now {
+                self.terminate_running_game();
+            }
+        }
+        let screenshot = self
+            .gameplay_probe
+            .as_ref()
+            .and_then(|probe| probe.screenshot_receiver.as_ref())
+            .and_then(|receiver| receiver.try_recv().ok());
+        if let Some(screenshot) = screenshot {
+            if let Some(probe) = &mut self.gameplay_probe {
+                probe.screenshot_receiver = None;
                 probe.terminating = true;
-                let _ = probe.record("deadline_reached");
+                if screenshot.get("path").is_some() && screenshot.get("error").is_none() {
+                    let _ = probe.record("screenshot", screenshot);
+                } else {
+                    probe.fail("screenshot_failed", screenshot);
+                }
             }
             self.terminate_running_game();
+        } else if self
+            .gameplay_probe
+            .as_ref()
+            .is_some_and(|probe| probe.screenshot_receiver.is_some())
+        {
+            context.request_repaint_after(Duration::from_millis(100));
         }
         if let Some(game) = &self.running_game {
             // Do not continuously render the frontend while a fullscreen game
@@ -2842,7 +3075,12 @@ impl eframe::App for PortableApp {
             && self.running_game.is_none()
         {
             if let Some(probe) = &mut self.gameplay_probe {
-                let _ = probe.record("gameplay_probe_complete");
+                let outcome = if GAMEPLAY_PROBE_FAILED.load(Ordering::SeqCst) {
+                    "gameplay_probe_failed"
+                } else {
+                    "gameplay_probe_complete"
+                };
+                let _ = probe.record(outcome, serde_json::json!({}));
                 probe.complete_recorded = true;
             }
             context.send_viewport_cmd(egui::ViewportCommand::Close);
