@@ -394,11 +394,69 @@ fn start_artwork_workers(
     jobs
 }
 
+/// The folder browser shared by the import and firmware dialogs. Listing a
+/// folder touches the disk, so it happens once per folder, not per frame.
+struct FileBrowser {
+    directory: PathBuf,
+    path_text: String,
+    selected: Option<PathBuf>,
+    listing: Vec<(bool, String, PathBuf)>,
+    listed: Option<PathBuf>,
+}
+
+impl FileBrowser {
+    fn new() -> Self {
+        let directory = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self {
+            path_text: directory.display().to_string(),
+            directory,
+            selected: None,
+            listing: Vec::new(),
+            listed: None,
+        }
+    }
+
+    fn open(&mut self, directory: PathBuf) {
+        self.path_text = directory.display().to_string();
+        self.directory = directory;
+        self.selected = None;
+    }
+
+    fn entries(&mut self) -> Vec<(bool, String, PathBuf)> {
+        if self.listed.as_ref() != Some(&self.directory) {
+            self.listing = std::fs::read_dir(&self.directory)
+                .map(|entries| {
+                    let mut listing = entries
+                        .filter_map(Result::ok)
+                        .map(|entry| {
+                            let path = entry.path();
+                            let is_directory = entry.file_type().is_ok_and(|kind| {
+                                kind.is_dir() || (kind.is_symlink() && path.is_dir())
+                            });
+                            (
+                                is_directory,
+                                entry.file_name().to_string_lossy().into_owned(),
+                                path,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    listing.sort_by_cached_key(|(is_directory, name, _)| {
+                        (!*is_directory, name.to_lowercase())
+                    });
+                    listing
+                })
+                .unwrap_or_default();
+            self.listed = Some(self.directory.clone());
+        }
+        self.listing.clone()
+    }
+}
+
 struct ImportDialog {
     entry: BrowseEntry,
-    directory: PathBuf,
-    selected: Option<PathBuf>,
-    path_text: String,
+    browser: FileBrowser,
     message: String,
 }
 
@@ -406,9 +464,7 @@ struct FirmwareDialog {
     system: String,
     files: Vec<FirmwareFileStatus>,
     selected_firmware: usize,
-    directory: PathBuf,
-    selected: Option<PathBuf>,
-    path_text: String,
+    browser: FileBrowser,
     message: String,
 }
 
@@ -566,18 +622,13 @@ struct BrowseViewKey {
 
 impl FirmwareDialog {
     fn new(readiness: &SystemReadiness) -> Self {
-        let directory = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
         let files = readiness.firmware_files.clone();
         let selected_firmware = files.iter().position(|file| !file.present).unwrap_or(0);
         Self {
             system: readiness.catalog_system.clone(),
             files,
             selected_firmware,
-            path_text: directory.display().to_string(),
-            directory,
-            selected: None,
+            browser: FileBrowser::new(),
             message: "Choose the firmware target, then select the file you obtained. Known hashes are informational, not a gate.".to_owned(),
         }
     }
@@ -585,9 +636,6 @@ impl FirmwareDialog {
 
 impl ImportDialog {
     fn new(entry: BrowseEntry) -> Self {
-        let directory = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
         let message = if entry.system.eq_ignore_ascii_case("mame") {
             "Select the intact MAME ROM-set ZIP (for example, mspacman.zip). If it came inside a RAR archive, select the RAR and RetroPort will unpack it."
         } else {
@@ -595,9 +643,7 @@ impl ImportDialog {
         };
         Self {
             entry,
-            path_text: directory.display().to_string(),
-            directory,
-            selected: None,
+            browser: FileBrowser::new(),
             message: message.to_owned(),
         }
     }
@@ -605,7 +651,7 @@ impl ImportDialog {
 
 struct PortableApp {
     context: egui::Context,
-    root_text: String,
+    layout: PortableLayout,
     catalog: Catalog,
     status: String,
     operation: Option<Receiver<OperationResult>>,
@@ -624,6 +670,7 @@ struct PortableApp {
     search_documents: Vec<String>,
     imported_ids: HashSet<String>,
     imported_manifests: HashMap<String, ImportedManifest>,
+    retrobat_present: bool,
     controls: Option<ControlsCatalog>,
     browse_view_key: Option<BrowseViewKey>,
     browse_systems: Vec<String>,
@@ -782,7 +829,7 @@ impl PortableApp {
         });
         Self {
             context: context.clone(),
-            root_text: layout.root.display().to_string(),
+            layout: layout.clone(),
             catalog: Catalog {
                 schema_version: 1,
                 generated_at: String::new(),
@@ -810,6 +857,7 @@ impl PortableApp {
             search_documents: Vec::new(),
             imported_ids: HashSet::new(),
             imported_manifests: HashMap::new(),
+            retrobat_present: layout.retrobat_executable().is_file(),
             controls: None,
             browse_view_key: None,
             browse_systems: Vec::new(),
@@ -917,7 +965,7 @@ impl PortableApp {
     }
 
     fn start_install(&mut self, entry: CatalogEntry) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         let (sender, receiver) = mpsc::channel();
         self.operation = Some(receiver);
         self.status = format!("Downloading and verifying {}…", entry.title);
@@ -945,7 +993,7 @@ impl PortableApp {
     }
 
     fn start_import_path(&mut self, entry: BrowseEntry, source: PathBuf) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         let (sender, receiver) = mpsc::channel();
         self.operation = Some(receiver);
         self.status = format!("Copying and preparing {}…", entry.title);
@@ -978,7 +1026,7 @@ impl PortableApp {
     }
 
     fn start_remove_import(&mut self, catalog_id: String, title: String) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         let (sender, receiver) = mpsc::channel();
         self.operation = Some(receiver);
         self.status = format!("Removing imported {title}…");
@@ -1005,7 +1053,7 @@ impl PortableApp {
     }
 
     fn start_firmware_import(&mut self, firmware: FirmwareFileStatus, source: PathBuf) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         let (sender, receiver) = mpsc::channel();
         self.operation = Some(receiver);
         self.status = format!("Adding firmware at bios/{}…", firmware.relative_path);
@@ -1038,7 +1086,7 @@ impl PortableApp {
     }
 
     fn start_firmware_download(&mut self, firmware: FirmwareFileStatus) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         let Some(download) = firmware.download.clone() else {
             self.status = "This firmware has no publisher download configured.".to_owned();
             return;
@@ -1093,7 +1141,7 @@ impl PortableApp {
         if self.readiness_refresh.is_some() {
             return;
         }
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         let entries = self.browse.entries.clone();
         let (sender, receiver) = mpsc::channel();
         self.readiness_refresh = Some(receiver);
@@ -1187,7 +1235,7 @@ impl PortableApp {
     }
 
     fn start_browse_download(&mut self, entry: BrowseEntry) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         let (sender, receiver) = mpsc::channel();
         self.operation = Some(receiver);
         self.status = format!(
@@ -1240,25 +1288,11 @@ impl PortableApp {
         if let Some(path) = dropped
             && path.is_file()
         {
-            dialog.path_text = path.display().to_string();
-            dialog.selected = Some(path);
+            dialog.browser.path_text = path.display().to_string();
+            dialog.browser.selected = Some(path);
             dialog.message = "Dropped file selected. Confirm the destination below.".to_owned();
         }
-        let directory_entries = std::fs::read_dir(&dialog.directory)
-            .map(|entries| {
-                let mut entries = entries
-                    .filter_map(Result::ok)
-                    .map(|entry| {
-                        let path = entry.path();
-                        (path.is_dir(), entry.file_name(), path)
-                    })
-                    .collect::<Vec<_>>();
-                entries.sort_by_cached_key(|(is_directory, name, _)| {
-                    (!*is_directory, name.to_string_lossy().to_ascii_lowercase())
-                });
-                entries
-            })
-            .unwrap_or_default();
+        let directory_entries = dialog.browser.entries();
 
         root.heading(format!("Firmware · {}", dialog.system.to_ascii_uppercase()));
         root.label(
@@ -1375,43 +1409,35 @@ impl PortableApp {
                 .clicked()
                 && let Some(home) = dirs::home_dir()
             {
-                dialog.directory = home;
-                dialog.path_text = dialog.directory.display().to_string();
-                dialog.selected = None;
+                dialog.browser.open(home);
             }
             if ui
                 .add(egui::Button::new("DOWNLOADS").fill(CONTROL_BACKGROUND))
                 .clicked()
                 && let Some(downloads) = dirs::download_dir()
             {
-                dialog.directory = downloads;
-                dialog.path_text = dialog.directory.display().to_string();
-                dialog.selected = None;
+                dialog.browser.open(downloads);
             }
             if ui
                 .add(egui::Button::new("UP").fill(CONTROL_BACKGROUND))
                 .clicked()
-                && let Some(parent) = dialog.directory.parent()
+                && let Some(parent) = dialog.browser.directory.parent()
             {
-                dialog.directory = parent.to_owned();
-                dialog.path_text = dialog.directory.display().to_string();
-                dialog.selected = None;
+                dialog.browser.open(parent.to_owned());
             }
             #[cfg(target_os = "linux")]
             if ui
                 .add(egui::Button::new("FILESYSTEM").fill(CONTROL_BACKGROUND))
                 .clicked()
             {
-                dialog.directory = PathBuf::from("/");
-                dialog.path_text = "/".to_owned();
-                dialog.selected = None;
+                dialog.browser.open(PathBuf::from("/"));
             }
         });
         root.horizontal(|ui| {
             let submitted = ui
                 .add_sized(
                     [(ui.available_width() - 52.0).max(180.0), 24.0],
-                    egui::TextEdit::singleline(&mut dialog.path_text)
+                    egui::TextEdit::singleline(&mut dialog.browser.path_text)
                         .background_color(INPUT_BACKGROUND),
                 )
                 .lost_focus()
@@ -1423,14 +1449,14 @@ impl PortableApp {
                 )
                 .clicked()
                 || submitted)
-                && !dialog.path_text.trim().is_empty()
+                && !dialog.browser.path_text.trim().is_empty()
             {
-                let path = PathBuf::from(dialog.path_text.trim());
+                let path = PathBuf::from(dialog.browser.path_text.trim());
                 if path.is_dir() {
-                    dialog.directory = path;
-                    dialog.selected = None;
+                    dialog.browser.directory = path;
+                    dialog.browser.selected = None;
                 } else if path.is_file() {
-                    dialog.selected = Some(path);
+                    dialog.browser.selected = Some(path);
                 } else {
                     dialog.message = "That path does not exist.".to_owned();
                 }
@@ -1444,19 +1470,17 @@ impl PortableApp {
             .show(root, |ui| {
                 for (is_directory, name, path) in &directory_entries {
                     let label = if *is_directory {
-                        format!("📁  {}", name.to_string_lossy())
+                        format!("📁  {name}")
                     } else {
-                        format!("      {}", name.to_string_lossy())
+                        format!("      {name}")
                     };
-                    let selected = dialog.selected.as_ref() == Some(path);
+                    let selected = dialog.browser.selected.as_ref() == Some(path);
                     if ui.selectable_label(selected, label).clicked() {
                         if *is_directory {
-                            dialog.directory = path.clone();
-                            dialog.path_text = path.display().to_string();
-                            dialog.selected = None;
+                            dialog.browser.open(path.clone());
                         } else {
-                            dialog.path_text = path.display().to_string();
-                            dialog.selected = Some(path.clone());
+                            dialog.browser.path_text = path.display().to_string();
+                            dialog.browser.selected = Some(path.clone());
                         }
                     }
                 }
@@ -1465,7 +1489,11 @@ impl PortableApp {
         root.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    dialog.selected.as_ref().is_some_and(|path| path.is_file())
+                    dialog
+                        .browser
+                        .selected
+                        .as_ref()
+                        .is_some_and(|path| path.is_file())
                         && self.operation.is_none(),
                     egui::Button::new(format!(
                         "{} {} bios/{}{}",
@@ -1477,7 +1505,7 @@ impl PortableApp {
                     .fill(CONTROL_BACKGROUND),
                 )
                 .clicked()
-                && let Some(source) = dialog.selected.clone()
+                && let Some(source) = dialog.browser.selected.clone()
             {
                 import = Some((target.clone(), source));
             }
@@ -1525,35 +1553,20 @@ impl PortableApp {
         if let Some(path) = dropped
             && (path.is_file() || path.is_dir())
         {
-            dialog.path_text = path.display().to_string();
+            dialog.browser.path_text = path.display().to_string();
             if path.is_dir() {
-                dialog.directory = path;
-                dialog.selected = None;
+                dialog.browser.directory = path;
+                dialog.browser.selected = None;
                 dialog.message =
                     "Dropped folder selected. Importing it preserves every required game file."
                         .to_owned();
             } else {
-                dialog.selected = Some(path);
+                dialog.browser.selected = Some(path);
                 dialog.message = "Dropped file selected. Confirm the import below.".to_owned();
             }
         }
 
-        let directory_entries = std::fs::read_dir(&dialog.directory)
-            .map(|entries| {
-                let mut entries: Vec<_> = entries
-                    .filter_map(Result::ok)
-                    .map(|entry| {
-                        let path = entry.path();
-                        let is_directory = path.is_dir();
-                        (is_directory, entry.file_name(), path)
-                    })
-                    .collect();
-                entries.sort_by_cached_key(|(is_directory, name, _)| {
-                    (!*is_directory, name.to_string_lossy().to_ascii_lowercase())
-                });
-                entries
-            })
-            .unwrap_or_default();
+        let directory_entries = dialog.browser.entries();
         root.heading(format!("Import {}", dialog.entry.title));
         root.label(
             egui::RichText::new(format!(
@@ -1734,7 +1747,9 @@ impl PortableApp {
         root.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    supports_folder && dialog.directory.is_dir() && self.operation.is_none(),
+                    supports_folder
+                        && dialog.browser.directory.is_dir()
+                        && self.operation.is_none(),
                     egui::Button::new("IMPORT THIS FOLDER").fill(CONTROL_BACKGROUND),
                 )
                 .on_hover_text(
@@ -1742,43 +1757,35 @@ impl PortableApp {
                 )
                 .clicked()
             {
-                import = Some((dialog.entry.clone(), dialog.directory.clone()));
+                import = Some((dialog.entry.clone(), dialog.browser.directory.clone()));
             }
             if ui
                 .add(egui::Button::new("HOME").fill(CONTROL_BACKGROUND))
                 .clicked()
                 && let Some(home) = dirs::home_dir()
             {
-                dialog.directory = home;
-                dialog.path_text = dialog.directory.display().to_string();
-                dialog.selected = None;
+                dialog.browser.open(home);
             }
             if ui
                 .add(egui::Button::new("DOWNLOADS").fill(CONTROL_BACKGROUND))
                 .clicked()
                 && let Some(downloads) = dirs::download_dir()
             {
-                dialog.directory = downloads;
-                dialog.path_text = dialog.directory.display().to_string();
-                dialog.selected = None;
+                dialog.browser.open(downloads);
             }
             if ui
                 .add(egui::Button::new("UP").fill(CONTROL_BACKGROUND))
                 .clicked()
-                && let Some(parent) = dialog.directory.parent()
+                && let Some(parent) = dialog.browser.directory.parent()
             {
-                dialog.directory = parent.to_owned();
-                dialog.path_text = dialog.directory.display().to_string();
-                dialog.selected = None;
+                dialog.browser.open(parent.to_owned());
             }
             #[cfg(target_os = "linux")]
             if ui
                 .add(egui::Button::new("FILESYSTEM").fill(CONTROL_BACKGROUND))
                 .clicked()
             {
-                dialog.directory = PathBuf::from("/");
-                dialog.path_text = "/".to_owned();
-                dialog.selected = None;
+                dialog.browser.open(PathBuf::from("/"));
             }
         });
 
@@ -1795,9 +1802,7 @@ impl PortableApp {
                         )
                         .clicked()
                 {
-                    dialog.directory = drive;
-                    dialog.path_text = dialog.directory.display().to_string();
-                    dialog.selected = None;
+                    dialog.browser.open(drive);
                 }
             }
         });
@@ -1809,7 +1814,7 @@ impl PortableApp {
             let submitted = ui
                 .add_sized(
                     [path_width, 24.0],
-                    egui::TextEdit::singleline(&mut dialog.path_text)
+                    egui::TextEdit::singleline(&mut dialog.browser.path_text)
                         .background_color(INPUT_BACKGROUND),
                 )
                 .lost_focus()
@@ -1821,14 +1826,14 @@ impl PortableApp {
                 )
                 .clicked()
                 || submitted)
-                && !dialog.path_text.trim().is_empty()
+                && !dialog.browser.path_text.trim().is_empty()
             {
-                let path = PathBuf::from(dialog.path_text.trim());
+                let path = PathBuf::from(dialog.browser.path_text.trim());
                 if path.is_dir() {
-                    dialog.directory = path;
-                    dialog.selected = None;
+                    dialog.browser.directory = path;
+                    dialog.browser.selected = None;
                 } else if path.is_file() {
-                    dialog.selected = Some(path);
+                    dialog.browser.selected = Some(path);
                 } else {
                     dialog.message = "That path does not exist.".to_owned();
                 }
@@ -1844,22 +1849,20 @@ impl PortableApp {
             .show(root, |ui| {
                 for (is_directory, name, path) in &directory_entries {
                     let label = if *is_directory {
-                        format!("📁  {}", name.to_string_lossy())
+                        format!("📁  {name}")
                     } else {
-                        format!("      {}", name.to_string_lossy())
+                        format!("      {name}")
                     };
-                    let selected = dialog.selected.as_ref() == Some(path);
+                    let selected = dialog.browser.selected.as_ref() == Some(path);
                     let response = ui.selectable_label(selected, label);
                     if response.double_clicked() && !*is_directory && self.operation.is_none() {
                         import = Some((dialog.entry.clone(), path.clone()));
                     } else if response.clicked() {
                         if *is_directory {
-                            dialog.directory = path.clone();
-                            dialog.path_text = path.display().to_string();
-                            dialog.selected = None;
+                            dialog.browser.open(path.clone());
                         } else {
-                            dialog.path_text = path.display().to_string();
-                            dialog.selected = Some(path.clone());
+                            dialog.browser.path_text = path.display().to_string();
+                            dialog.browser.selected = Some(path.clone());
                         }
                     }
                 }
@@ -1868,12 +1871,16 @@ impl PortableApp {
         root.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    dialog.selected.as_ref().is_some_and(|path| path.is_file())
+                    dialog
+                        .browser
+                        .selected
+                        .as_ref()
+                        .is_some_and(|path| path.is_file())
                         && self.operation.is_none(),
                     egui::Button::new("IMPORT AND PREPARE GAME").fill(ACCENT),
                 )
                 .clicked()
-                && let Some(path) = dialog.selected.clone()
+                && let Some(path) = dialog.browser.selected.clone()
             {
                 import = Some((dialog.entry.clone(), path));
             }
@@ -1895,7 +1902,7 @@ impl PortableApp {
     }
 
     fn launch_library(&mut self) {
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         self.status =
             match LaunchPlan::for_current_host(&layout).and_then(|plan| plan.spawn().map(|_| ())) {
                 Ok(()) => "RetroBat launched with the refreshed game library.".to_owned(),
@@ -1909,7 +1916,7 @@ impl PortableApp {
                 .to_owned();
             return;
         }
-        let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+        let layout = self.layout.clone();
         let backend = self
             .readiness
             .as_ref()
@@ -2060,7 +2067,9 @@ impl eframe::App for PortableApp {
                 probe.started = true;
             }
             if let Some((entry, manifest)) = launch {
-                let rom = PortableLayout::new(PathBuf::from(&self.root_text))
+                let rom = self
+                    .layout
+                    .clone()
                     .root
                     .join(&manifest.launch_relative_path);
                 self.launch_game(&entry.id, &entry.title, &manifest.system, &rom);
@@ -2097,9 +2106,9 @@ impl eframe::App for PortableApp {
             self.status = result.message.clone();
             self.operation_notice = Some(result);
             self.operation = None;
-            self.imported_manifests =
-                load_imported_manifests(&PortableLayout::new(PathBuf::from(&self.root_text)));
+            self.imported_manifests = load_imported_manifests(&self.layout);
             self.imported_ids = self.imported_manifests.keys().cloned().collect();
+            self.retrobat_present = self.layout.retrobat_executable().is_file();
             self.browse_view_key = None;
             self.refresh_readiness();
         }
@@ -2282,8 +2291,7 @@ impl eframe::App for PortableApp {
                     .color(egui::Color32::from_gray(165)),
             );
             ui.horizontal(|ui| {
-                let layout = PortableLayout::new(PathBuf::from(&self.root_text));
-                let can_launch = layout.retrobat_executable().is_file();
+                let can_launch = self.retrobat_present;
                 if ui
                     .add_enabled(
                         can_launch && self.operation.is_none(),
@@ -2459,7 +2467,7 @@ impl eframe::App for PortableApp {
                     let mut requested_remove_import = None;
                     let mut requested_play: Option<(String, String, String, PathBuf)> = None;
                     let mut requested_terminate = false;
-                    let layout = PortableLayout::new(PathBuf::from(&self.root_text));
+                    let layout = self.layout.clone();
 
                     let (grid_columns, card_width, grid_spacing) =
                         browse_grid_geometry(library_viewport_width);
@@ -3169,18 +3177,18 @@ impl eframe::App for PortableApp {
                         });
                     }
                     ui.add_space(8.0);
-                    ui.collapsing("Bundle settings", |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Portable bundle:");
-                            ui.add_enabled(
-                                self.operation.is_none(),
-                                egui::TextEdit::singleline(&mut self.root_text)
-                                    .desired_width(f32::INFINITY)
-                                    .background_color(INPUT_BACKGROUND),
+                    ui.collapsing("Installation", |ui| {
+                        // The installation is the folder this launcher lives
+                        // in; RetroPort never switches to another one.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("This installation:");
+                            ui.label(
+                                egui::RichText::new(self.layout.root.display().to_string())
+                                    .monospace(),
                             );
                         });
-                        if !layout.retrobat_executable().is_file() {
-                            ui.label("Expected RetroBat/RetroBat.exe inside this folder.");
+                        if !self.retrobat_present {
+                            ui.label("RetroBat/RetroBat.exe is missing from this installation; run its bootstrap or verifier.");
                         }
                     });
                 });
