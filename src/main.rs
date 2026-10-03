@@ -36,7 +36,75 @@ const INPUT_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(7, 9, 13);
 const CONTROL_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(36, 43, 58);
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(104, 146, 255);
 
+/// The Windows build is a GUI program, which Windows starts without a
+/// console. Command-line use (self-check, import, probes) attaches to the
+/// console it was started from so its output and errors are visible.
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    // SAFETY: AttachConsole takes no pointers; failure (no parent console,
+    // or output already redirected) leaves the process unchanged.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+const USAGE: &str = "\
+Usage: RetroPort [--bundle-root FOLDER] [ACTION]
+
+Without an action, RetroPort opens its library.
+
+Actions:
+  --download ID           Download a card's game from its pinned source, verify it, and install it
+  --import ID --file PATH Import your own game file, archive, or folder onto a card
+  --remove ID             Remove what DOWNLOAD or IMPORT placed for a card, keeping modified files
+  --self-check            Validate the installation and print the report as JSON
+                          (--self-check-output FILE also writes it to FILE)
+  --gameplay-probe ID     Play an installed card through PLAY, hold it, terminate it, and record
+                          every transition (--gameplay-probe-output FILE is required;
+                          --gameplay-probe-seconds N, at least 10, defaults to 20)
+  --install ID            Install an entry of the trusted catalogue
+  --uninstall ID          Remove an entry of the trusted catalogue, keeping modified files
+
+Options:
+  --bundle-root FOLDER    The portable folder to use (default: the one holding this program)
+  --startup-probe-output FILE
+                          Record the library's startup timings to FILE
+  -h, --help              Show this help
+
+A card's ID appears when you hover over its title, for example homebrew-hub/dango-dash.
+";
+
+fn usage_error(message: &str) -> ! {
+    eprintln!("{message}\nRun RetroPort --help for usage.");
+    std::process::exit(2);
+}
+
+fn flag_path(
+    args: &mut impl Iterator<Item = std::ffi::OsString>,
+    flag: &str,
+    what: &str,
+) -> PathBuf {
+    args.next()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| usage_error(&format!("{flag} requires {what}")))
+}
+
+fn flag_id(args: &mut impl Iterator<Item = std::ffi::OsString>, flag: &str) -> String {
+    args.next()
+        .and_then(|value| value.into_string().ok())
+        .unwrap_or_else(|| usage_error(&format!("{flag} requires a catalogue id")))
+}
+
 fn main() -> eframe::Result {
+    #[cfg(target_os = "windows")]
+    if std::env::args_os().len() > 1 {
+        attach_parent_console();
+    }
     let mut bundle_root = std::env::current_exe()
         .ok()
         .map(|path| PortableLayout::discover(&path).root)
@@ -47,98 +115,68 @@ fn main() -> eframe::Result {
     let mut uninstall_id = None;
     let mut download_id = None;
     let mut import_id = None;
+    let mut remove_id = None;
     let mut import_file = None;
     let mut startup_probe_output = None;
     let mut gameplay_probe_id = None;
     let mut gameplay_probe_output = None;
     let mut gameplay_probe_seconds = 20u64;
-    let mut args = std::env::args().skip(1);
+    // Paths are taken as the OS gives them, so a name that is not valid
+    // UTF-8 still reaches the filesystem intact.
+    let mut args = std::env::args_os().skip(1);
     while let Some(argument) = args.next() {
-        match argument.as_str() {
-            "--bundle-root" => {
-                if let Some(value) = args.next() {
-                    bundle_root = PathBuf::from(value);
-                }
+        let Some(flag) = argument.to_str() else {
+            usage_error(&format!("Unknown argument: {}", argument.to_string_lossy()));
+        };
+        match flag {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return Ok(());
             }
+            "--bundle-root" => bundle_root = flag_path(&mut args, flag, "a folder"),
             "--self-check" => self_check_only = true,
-            "--install" => {
-                install_id = args.next();
-                if install_id.is_none() {
-                    eprintln!("--install requires a catalog id");
-                    std::process::exit(2);
-                }
-            }
-            "--uninstall" => {
-                uninstall_id = args.next();
-                if uninstall_id.is_none() {
-                    eprintln!("--uninstall requires a catalog id");
-                    std::process::exit(2);
-                }
-            }
-            "--download" => {
-                download_id = args.next();
-                if download_id.is_none() {
-                    eprintln!("--download requires a browse catalog id");
-                    std::process::exit(2);
-                }
-            }
-            "--import" => {
-                import_id = args.next();
-                if import_id.is_none() {
-                    eprintln!("--import requires a browse catalog id");
-                    std::process::exit(2);
-                }
-            }
-            "--file" => {
-                import_file = args.next().map(PathBuf::from);
-                if import_file.is_none() {
-                    eprintln!("--file requires a local game path");
-                    std::process::exit(2);
-                }
-            }
+            "--install" => install_id = Some(flag_id(&mut args, flag)),
+            "--uninstall" => uninstall_id = Some(flag_id(&mut args, flag)),
+            "--download" => download_id = Some(flag_id(&mut args, flag)),
+            "--import" => import_id = Some(flag_id(&mut args, flag)),
+            "--remove" => remove_id = Some(flag_id(&mut args, flag)),
+            "--file" => import_file = Some(flag_path(&mut args, flag, "a local game path")),
             "--self-check-output" => {
-                self_check_output = args.next().map(PathBuf::from);
-                if self_check_output.is_none() {
-                    eprintln!("--self-check-output requires a path");
-                    std::process::exit(2);
-                }
+                self_check_output = Some(flag_path(&mut args, flag, "a path"));
             }
             "--startup-probe-output" => {
-                startup_probe_output = args.next().map(PathBuf::from);
-                if startup_probe_output.is_none() {
-                    eprintln!("--startup-probe-output requires a path");
-                    std::process::exit(2);
-                }
+                startup_probe_output = Some(flag_path(&mut args, flag, "a path"));
             }
-            "--gameplay-probe" => {
-                gameplay_probe_id = args.next();
-                if gameplay_probe_id.is_none() {
-                    eprintln!("--gameplay-probe requires an imported browse catalog id");
-                    std::process::exit(2);
-                }
-            }
+            "--gameplay-probe" => gameplay_probe_id = Some(flag_id(&mut args, flag)),
             "--gameplay-probe-output" => {
-                gameplay_probe_output = args.next().map(PathBuf::from);
-                if gameplay_probe_output.is_none() {
-                    eprintln!("--gameplay-probe-output requires a path");
-                    std::process::exit(2);
-                }
+                gameplay_probe_output = Some(flag_path(&mut args, flag, "a path"));
             }
             "--gameplay-probe-seconds" => {
                 gameplay_probe_seconds = args
                     .next()
-                    .and_then(|value| value.parse().ok())
+                    .and_then(|value| value.to_str()?.parse().ok())
                     .filter(|seconds| *seconds >= 10)
                     .unwrap_or_else(|| {
-                        eprintln!("--gameplay-probe-seconds requires an integer of at least 10");
-                        std::process::exit(2);
+                        usage_error("--gameplay-probe-seconds requires an integer of at least 10")
                     });
             }
-            other => {
-                eprintln!("Unknown argument: {other}");
-                std::process::exit(2);
-            }
+            other => usage_error(&format!("Unknown argument: {other}")),
         }
+    }
+    let actions = [
+        self_check_only,
+        install_id.is_some(),
+        uninstall_id.is_some(),
+        download_id.is_some(),
+        import_id.is_some(),
+        remove_id.is_some(),
+        gameplay_probe_id.is_some(),
+    ];
+    if actions.into_iter().filter(|chosen| *chosen).count() > 1 {
+        usage_error(
+            "Choose one action: --self-check, --download, --import, --remove, \
+             --gameplay-probe, --install, or --uninstall.",
+        );
     }
 
     let gameplay_probe = gameplay_probe_id.map(|catalog_id| GameplayProbeConfig {
@@ -253,6 +291,21 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    if let Some(requested_id) = remove_id {
+        match remove_import(&layout, &requested_id) {
+            Ok(report) => println!(
+                "Removed {} owned file(s); preserved {} modified file(s); {} already absent.",
+                report.removed.len(),
+                report.preserved_modified.len(),
+                report.already_missing.len()
+            ),
+            Err(error) => {
+                eprintln!("Remove failed safely: {error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     if let Some(requested_id) = download_id {
         let browse = BrowseCatalog::built_in().unwrap_or_else(|error| {
             eprintln!("Browse catalog rejected: {error}");
@@ -303,7 +356,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "RetroBat Portable",
+        "RetroPort",
         options,
         Box::new(move |creation_context| {
             Ok(Box::new(PortableApp::new(
@@ -2629,7 +2682,7 @@ impl eframe::App for PortableApp {
                         .color(ACCENT),
                 );
                 ui.label(
-                    egui::RichText::new("// PORTABLE")
+                    egui::RichText::new("PORT")
                         .size(28.0)
                         .strong()
                         .color(egui::Color32::WHITE),
@@ -2637,7 +2690,7 @@ impl eframe::App for PortableApp {
             });
             ui.label(
                 egui::RichText::new(
-                    "One visual library for direct downloads and locally imported classics.",
+                    "One visual library for verified downloads and your own imported games.",
                 )
                     .size(15.0)
                     .color(egui::Color32::from_gray(165)),
