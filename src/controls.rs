@@ -531,32 +531,117 @@ fn controller_profile(layout: &PortableLayout) -> Option<ControllerProfile> {
 
 #[cfg(target_os = "linux")]
 fn connected_controller() -> Option<(String, String, String)> {
-    let inputs = fs::read_dir("/sys/class/input").ok()?;
-    for entry in inputs.filter_map(Result::ok) {
-        if !entry.file_name().to_string_lossy().starts_with("js") {
-            continue;
-        }
-        let device = entry.path().join("device");
-        let name = fs::read_to_string(device.join("name"))
-            .ok()?
-            .trim()
-            .to_owned();
-        let vendor = u16::from_str_radix(
-            fs::read_to_string(device.join("id/vendor")).ok()?.trim(),
-            16,
-        )
-        .ok()?;
-        let product = u16::from_str_radix(
-            fs::read_to_string(device.join("id/product")).ok()?.trim(),
-            16,
-        )
-        .ok()?;
-        return Some((name, vendor.to_string(), product.to_string()));
-    }
-    None
+    let mut joysticks = fs::read_dir("/sys/class/input")
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("js"))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    // js0 is the controller RetroArch assigns to player one.
+    joysticks.sort();
+    joysticks.into_iter().find_map(|joystick| {
+        let device = joystick.join("device");
+        let read = |name: &str| fs::read_to_string(device.join(name)).ok();
+        let name = read("name")?.trim().to_owned();
+        let vendor = u16::from_str_radix(read("id/vendor")?.trim(), 16).ok()?;
+        let product = u16::from_str_radix(read("id/product")?.trim(), 16).ok()?;
+        Some((name, vendor.to_string(), product.to_string()))
+    })
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows lists game controllers through the Raw Input API: HID devices on
+/// the generic-desktop page with the joystick (4) or gamepad (5) usage.
+#[cfg(target_os = "windows")]
+fn connected_controller() -> Option<(String, String, String)> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawInputDeviceList {
+        device: *mut c_void,
+        kind: u32,
+    }
+    #[repr(C)]
+    struct DeviceInfo {
+        size: u32,
+        kind: u32,
+        vendor: u32,
+        product: u32,
+        version: u32,
+        usage_page: u16,
+        usage: u16,
+        padding: [u8; 8],
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetRawInputDeviceList(list: *mut RawInputDeviceList, count: *mut u32, size: u32) -> u32;
+        fn GetRawInputDeviceInfoW(
+            device: *mut c_void,
+            command: u32,
+            data: *mut c_void,
+            size: *mut u32,
+        ) -> u32;
+    }
+    const RIM_TYPEHID: u32 = 2;
+    const RIDI_DEVICEINFO: u32 = 0x2000_000b;
+    let entry_size = std::mem::size_of::<RawInputDeviceList>() as u32;
+    let mut count = 0u32;
+    // SAFETY: a null list asks only for the device count.
+    if unsafe { GetRawInputDeviceList(std::ptr::null_mut(), &mut count, entry_size) } != 0
+        || count == 0
+    {
+        return None;
+    }
+    let mut devices = vec![
+        RawInputDeviceList {
+            device: std::ptr::null_mut(),
+            kind: 0,
+        };
+        count as usize
+    ];
+    // SAFETY: `devices` holds `count` correctly sized entries.
+    let listed = unsafe { GetRawInputDeviceList(devices.as_mut_ptr(), &mut count, entry_size) };
+    if listed == u32::MAX {
+        return None;
+    }
+    devices.truncate(listed as usize);
+    devices
+        .into_iter()
+        .filter(|device| device.kind == RIM_TYPEHID)
+        .find_map(|device| {
+            let mut info = DeviceInfo {
+                size: std::mem::size_of::<DeviceInfo>() as u32,
+                kind: 0,
+                vendor: 0,
+                product: 0,
+                version: 0,
+                usage_page: 0,
+                usage: 0,
+                padding: [0; 8],
+            };
+            let mut size = info.size;
+            // SAFETY: `info` is a RID_DEVICE_INFO-sized buffer with cbSize set.
+            let written = unsafe {
+                GetRawInputDeviceInfoW(
+                    device.device,
+                    RIDI_DEVICEINFO,
+                    (&mut info as *mut DeviceInfo).cast(),
+                    &mut size,
+                )
+            };
+            (written != u32::MAX && info.usage_page == 1 && matches!(info.usage, 4 | 5)).then(
+                || {
+                    (
+                        format!("Game controller {:04x}:{:04x}", info.vendor, info.product),
+                        info.vendor.to_string(),
+                        info.product.to_string(),
+                    )
+                },
+            )
+        })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn connected_controller() -> Option<(String, String, String)> {
     None
 }
